@@ -1,11 +1,14 @@
 """
-Crypto Latency Arbitrage Engine v3.4.
+Crypto Latency Arbitrage Engine v3.5.
 Trades the DISLOCATION — when Binance moves and Polymarket hasn't caught up yet.
 
-v3.4: Fixed critical fill-detection bug.
-- FIX: Orders are now verified via CLOB API (get_order) before marking expired.
-- FIX: Filled orders are NEVER credited back — bot waits for resolution instead.
-- FIX: Only truly unfilled orders (size_matched=0) get cancelled and money returned.
+v3.5: Real orderbook pricing — fix FOK fill rate.
+- NEW: Fetches CLOB orderbook to get actual best ask price before trading.
+- NEW: Recalculates edge at real ask price — only trades if edge ≥ 5% at fill price.
+- NEW: Kelly sizing uses real edge/price, not Gamma midpoint.
+- NEW: 15s cooldown on FOK rejects (was spamming 30+/min with no cooldown).
+- FIX: No more blind +2¢ limit price that missed the actual ask.
+v3.4: Fixed critical fill-detection bug (CLOB fill verification).
 v3.3: Kelly criterion sizing + early-exit loss cutting.
 v3.2: Allium on-chain intelligence integration.
 - All v3/v3.1 guards remain: no both-sides, max entry price, trade limits, late-join protection.
@@ -428,6 +431,22 @@ def execute_early_exit(client, trade: dict, sell_price: float) -> float:
         return 0.0
 
 
+# --- v3.5: Real orderbook pricing ---
+def get_best_ask(client, token_id: str) -> tuple[float, float] | None:
+    """
+    Get the best (lowest) ask price and size from the CLOB orderbook.
+    Returns (price, size) or None if no asks exist.
+    """
+    try:
+        book = client.get_order_book(token_id)
+        if not book.asks:
+            return None
+        best = book.asks[0]  # Lowest ask = best price to buy at
+        return (float(best.price), float(best.size))
+    except Exception:
+        return None
+
+
 # Track last trade time per coin (for cooldown)
 last_trade_time: dict = {}
 
@@ -529,19 +548,57 @@ def find_arb_signal(coin: str, market: CryptoMarket) -> ArbSignal | None:
     return None
 
 
-def execute_arb_trade(client, signal: ArbSignal, bet_amount: float = 0) -> PlacedOrder | None:
-    """Execute an arb trade on Polymarket. Uses Kelly-sized bet_amount."""
+def execute_arb_trade(client, signal: ArbSignal, bet_amount: float = 0, bankroll_balance: float = 0) -> PlacedOrder | None:
+    """
+    Execute an arb trade on Polymarket. v3.5: Uses real orderbook pricing.
+
+    Fetches the CLOB orderbook to find the actual best ask, recalculates edge
+    at that price, and only trades if the edge is still above threshold.
+    """
     import math
     from py_clob_client.clob_types import OrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY
 
     MIN_SHARES = 5  # Polymarket minimum order size
 
-    # Use Kelly amount if provided, otherwise fall back to flat size
-    usdc_to_spend = bet_amount if bet_amount > 0 else ARB_BET_SIZE
+    # v3.5: Get real best ask from CLOB orderbook
+    best = get_best_ask(client, signal.token_id)
+    if best is None:
+        console.print(
+            f"[dim][v3.5] {signal.coin} {signal.side.upper()} — "
+            f"no asks on book, skipping[/dim]"
+        )
+        return None
 
-    # Slightly aggressive limit price to ensure fill
-    limit_price = min(round(signal.polymarket_price + 0.02, 2), 0.99)
+    best_ask_price, best_ask_size = best
+
+    # v3.5: Recalculate edge at the actual ask price (not the Gamma midpoint)
+    fee_at_ask = calculate_fee(best_ask_price)
+    real_edge = signal.implied_prob - best_ask_price - fee_at_ask
+
+    if real_edge < ARB_MIN_EDGE:
+        console.print(
+            f"[dim][v3.5] {signal.coin} {signal.side.upper()} — "
+            f"edge at best ask too thin: {real_edge:.1%} (mid edge: {signal.edge:.1%}) | "
+            f"Poly mid: ${signal.polymarket_price:.3f} → Ask: ${best_ask_price:.3f}[/dim]"
+        )
+        return None
+
+    # v3.5: Recalculate Kelly at real edge and real price
+    bet_amt = kelly_bet_size(real_edge, best_ask_price, bankroll_balance) if bankroll_balance > 0 else bet_amount
+    usdc_to_spend = bet_amt if bet_amt > 0 else ARB_BET_SIZE
+
+    # Bid 1¢ above best ask to ensure fill
+    limit_price = min(round(best_ask_price + 0.01, 2), 0.99)
+
+    # v3.5: Don't exceed max entry price at the real ask
+    if limit_price > MAX_ENTRY_PRICE:
+        console.print(
+            f"[dim][v3.5] {signal.coin} {signal.side.upper()} — "
+            f"best ask ${best_ask_price:.3f} exceeds max entry ${MAX_ENTRY_PRICE}[/dim]"
+        )
+        return None
+
     raw_size = usdc_to_spend / limit_price
     size = max(MIN_SHARES, math.floor(raw_size * 100) / 100)  # At least 5 shares, 2 decimal
     actual_cost = limit_price * size
@@ -585,8 +642,8 @@ def execute_arb_trade(client, signal: ArbSignal, bet_amount: float = 0) -> Place
 
         msg = (
             f"TRADE: {signal.coin} {signal.side.upper()} "
-            f"@ ${limit_price:.3f} | {size} shares | Edge: {signal.edge:.1%} | "
-            f"${actual_cost:.2f} USDC | {signal.seconds_remaining}s left"
+            f"@ ${limit_price:.3f} (ask: ${best_ask_price:.3f}) | {size} shares | "
+            f"Real edge: {real_edge:.1%} | ${actual_cost:.2f} USDC | {signal.seconds_remaining}s left"
         )
         console.print(f"[bold green][arb] {msg}[/bold green]")
         log_trade(msg)
@@ -609,8 +666,8 @@ async def run_arb_bot():
     """Main arb bot loop."""
     console.print()
     console.print("[bold cyan]╔══════════════════════════════════════╗[/bold cyan]")
-    console.print("[bold cyan]║   CRYPTO LATENCY ARB BOT  v3.4        ║[/bold cyan]")
-    console.print("[bold cyan]║   CLOB fill detection + Kelly + Allium║[/bold cyan]")
+    console.print("[bold cyan]║   CRYPTO LATENCY ARB BOT  v3.5        ║[/bold cyan]")
+    console.print("[bold cyan]║   Real orderbook pricing + Kelly      ║[/bold cyan]")
     console.print("[bold cyan]╚══════════════════════════════════════╝[/bold cyan]")
     console.print()
     console.print(f"  Coins:           {', '.join(ARB_COINS)}")
@@ -622,7 +679,7 @@ async def run_arb_bot():
     console.print(f"  Max trades/coin: {MAX_TRADES_PER_COIN_PER_WINDOW} per window")
     console.print(f"  Early exit:      Sell if win prob < {EARLY_EXIT_BAIL_PROB:.0%} (cut losses)")
     console.print(f"  Log file:        {LOG_FILE}")
-    console.print(f"  [dim]v3.4: CLOB fill verification + Kelly sizing + early exit + Allium on-chain[/dim]")
+    console.print(f"  [dim]v3.5: Real orderbook pricing + CLOB fill verification + Kelly + Allium[/dim]")
     console.print(f"  [dim]Rule: wins add to bankroll, losses subtract. Hit $0 = done for the day.[/dim]")
     console.print()
 
@@ -811,23 +868,25 @@ async def run_arb_bot():
                     else:
                         allium_tag = " | 🔗 allium neutral"
 
-                # v3.3: Kelly-sized bet
-                bet_amt = kelly_bet_size(signal.edge, signal.polymarket_price, bankroll.balance)
+                # v3.5: Preview orderbook before logging signal
+                best = get_best_ask(client, signal.token_id)
+                ask_str = f"${best[0]:.3f}" if best else "none"
 
                 console.print(
                     f"[bold yellow]>>> SIGNAL: {signal.coin} {signal.side.upper()} | "
-                    f"Edge: {signal.edge:.1%} | Binance P(Up): {signal.implied_prob:.1%} | "
-                    f"Poly: ${signal.polymarket_price:.3f} | Kelly: ${bet_amt:.2f} | "
+                    f"Mid edge: {signal.edge:.1%} | P(Up): {signal.implied_prob:.1%} | "
+                    f"Poly mid: ${signal.polymarket_price:.3f} | Best ask: {ask_str} | "
                     f"{signal.seconds_remaining}s left{allium_tag}[/bold yellow]"
                 )
                 log_trade(
                     f"SIGNAL: {signal.coin} {signal.side.upper()} | "
-                    f"Edge: {signal.edge:.1%} | P(Up): {signal.implied_prob:.1%} | "
-                    f"Poly: ${signal.polymarket_price:.3f} | Kelly: ${bet_amt:.2f} | "
+                    f"Mid edge: {signal.edge:.1%} | P(Up): {signal.implied_prob:.1%} | "
+                    f"Poly mid: ${signal.polymarket_price:.3f} | Best ask: {ask_str} | "
                     f"{signal.seconds_remaining}s left{allium_tag}"
                 )
 
-                result = execute_arb_trade(client, signal, bet_amount=bet_amt)
+                # v3.5: Pass bankroll balance for Kelly recalculation at real ask price
+                result = execute_arb_trade(client, signal, bet_amount=0, bankroll_balance=bankroll.balance)
                 if result:
                     bankroll.place_bet(
                         amount=result.usdc_spent,
@@ -837,10 +896,13 @@ async def run_arb_bot():
                         buy_price=result.price,
                         window_ts=current_window_ts,
                         shares=result.size,
-                        order_id=result.order_id,  # v3.4: track for CLOB fill verification
+                        order_id=result.order_id,
                         edge=signal.edge,
                         secs_left=signal.seconds_remaining,
                     )
+                else:
+                    # v3.5: Cooldown on reject/skip — 15s instead of full 120s
+                    last_trade_time[signal.coin] = time.time() - ARB_COOLDOWN_SECS + 15
 
             # v3.4.1: Early exits DISABLED — sell-side fill verification not implemented.
             # Trades go to resolution (win or lose). No phantom recovery credits.
