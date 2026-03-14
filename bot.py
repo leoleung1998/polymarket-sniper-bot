@@ -186,6 +186,12 @@ def cmd_scan():
         console.print(f"  ... and {len(outcomes) - 50} more")
 
 
+def cmd_bracket():
+    """Run v4 bracket bot — weather + crypto daily brackets."""
+    from arb_engine_v4 import main as bracket_main
+    bracket_main()
+
+
 def cmd_positions():
     """Show current positions and P&L."""
     show_positions()
@@ -202,6 +208,7 @@ def main():
         "run": cmd_run,
         "scan": cmd_scan,
         "positions": cmd_positions,
+        "bracket": cmd_bracket,
     }
 
     if cmd in commands:
@@ -211,7 +218,8 @@ def main():
         console.print()
         console.print("Usage:")
         console.print("  python bot.py scan        # Preview cheap outcomes (no buying)")
-        console.print("  python bot.py run         # Start the bot (scan + buy loop)")
+        console.print("  python bot.py run         # Start v3.5 bot (15-min crypto arb)")
+        console.print("  python bot.py bracket     # Start v4 bot (daily brackets: weather + crypto)")
         console.print("  python bot.py positions   # Show positions and P&L")
 
 

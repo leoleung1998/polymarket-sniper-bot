@@ -405,6 +405,172 @@ class AlliumFeed:
         return wallets
 
     # ═══════════════════════════════════════════════
+    #  BRACKET MARKET QUERIES (v4)
+    # ═══════════════════════════════════════════════
+
+    def get_bracket_signal(self, coin: str, slug: str) -> AlliumSignal:
+        """
+        Get Allium signal for a daily bracket market (v4).
+
+        Queries recent trades on "Bitcoin above" / "Ethereum above" markets
+        instead of the 15-min "up or down" markets used by v3.5.
+
+        Args:
+            coin: "BTC" or "ETH"
+            slug: Event slug for cache keying
+
+        Returns:
+            AlliumSignal with flow and smart money data for bracket markets.
+        """
+        if not self._available:
+            if time.time() - self._last_error_ts < self._error_backoff:
+                return AlliumSignal(coin=coin, window_ts=0, error="Allium unavailable")
+            self._available = True
+
+        if not ALLIUM_API_KEY:
+            return AlliumSignal(coin=coin, window_ts=0, error="No API key")
+
+        # Check signal cache (keyed by slug)
+        cache_key = ("bracket", coin, slug)
+        if cache_key in self._signal_cache:
+            cached = self._signal_cache[cache_key]
+            if time.time() - cached.timestamp < SIGNAL_CACHE_TTL:
+                return cached
+
+        signal = AlliumSignal(coin=coin, window_ts=0, timestamp=time.time())
+
+        # Query bracket flow imbalance
+        try:
+            imbalance, yes_vol, no_vol, trade_count = self._get_bracket_flow(coin)
+            signal.flow_imbalance = imbalance
+            signal.flow_up_volume = yes_vol      # Reuse up/down fields for yes/no
+            signal.flow_down_volume = no_vol
+            signal.flow_total_trades = trade_count
+            signal.has_flow_data = True
+        except Exception as e:
+            signal.error = f"Bracket flow: {e}"
+
+        # Query smart money on bracket markets
+        try:
+            side, vol, count = self._get_bracket_smart_money(coin)
+            signal.smart_money_side = side
+            signal.smart_money_volume = vol
+            signal.smart_money_count = count
+            signal.has_smart_data = True
+        except Exception as e:
+            err = f"Bracket smart$: {e}"
+            signal.error = f"{signal.error}; {err}" if signal.error else err
+
+        self._signal_cache[cache_key] = signal
+        return signal
+
+    def _get_bracket_flow(self, coin: str) -> tuple[float, float, float, int]:
+        """
+        Get volume flow on daily bracket markets (last 6 hours).
+
+        For bracket markets, "Yes" = bullish (price will be above threshold),
+        "No" = bearish. We aggregate across all thresholds for the coin.
+
+        Returns: (imbalance, yes_volume, no_volume, total_trades)
+        """
+        coin_name = COIN_NAMES.get(coin, coin)
+
+        sql = f"""
+        SELECT
+            token_outcome,
+            SUM(usd_collateral_amount) as total_volume,
+            COUNT(*) as trade_count
+        FROM polygon.predictions.trades_enriched
+        WHERE category = 'crypto'
+          AND LOWER(question) LIKE '%{coin_name.lower()} % above%'
+          AND block_timestamp >= DATEADD(hour, -6, CURRENT_TIMESTAMP())
+        GROUP BY token_outcome
+        """
+
+        rows = self._run_sql(sql, cache_ttl=FLOW_CACHE_TTL)
+
+        yes_vol = 0.0
+        no_vol = 0.0
+        total_trades = 0
+
+        for row in rows:
+            outcome = str(row.get("token_outcome", row.get("TOKEN_OUTCOME", ""))).lower()
+            vol = float(row.get("total_volume", row.get("TOTAL_VOLUME", 0)) or 0)
+            trades = int(row.get("trade_count", row.get("TRADE_COUNT", 0)) or 0)
+
+            if outcome == "yes":
+                yes_vol = vol
+            elif outcome == "no":
+                no_vol = vol
+            total_trades += trades
+
+        total = yes_vol + no_vol
+        if total == 0:
+            return 0.0, 0.0, 0.0, total_trades
+
+        imbalance = (yes_vol - no_vol) / total
+        return imbalance, yes_vol, no_vol, total_trades
+
+    def _get_bracket_smart_money(self, coin: str) -> tuple[Optional[str], float, int]:
+        """
+        Check smart money activity on daily bracket markets (last 6 hours).
+
+        Returns: (dominant_side, total_volume, wallet_count)
+        dominant_side is "up" (buying YES = bullish) or "down" (buying NO = bearish)
+        """
+        smart_wallets = self._get_smart_wallet_list()
+        if not smart_wallets:
+            return None, 0.0, 0
+
+        coin_name = COIN_NAMES.get(coin, coin)
+        wallet_list = ", ".join(f"'{w}'" for w in smart_wallets[:20])
+
+        sql = f"""
+        SELECT
+            token_outcome,
+            SUM(usd_collateral_amount) as volume,
+            COUNT(DISTINCT taker) as wallet_count
+        FROM polygon.predictions.trades_enriched
+        WHERE category = 'crypto'
+          AND LOWER(question) LIKE '%{coin_name.lower()} % above%'
+          AND block_timestamp >= DATEADD(hour, -6, CURRENT_TIMESTAMP())
+          AND taker IN ({wallet_list})
+        GROUP BY token_outcome
+        """
+
+        rows = self._run_sql(sql, cache_ttl=FLOW_CACHE_TTL)
+
+        yes_vol = 0.0
+        no_vol = 0.0
+        yes_wallets = 0
+        no_wallets = 0
+
+        for row in rows:
+            outcome = str(row.get("token_outcome", row.get("TOKEN_OUTCOME", ""))).lower()
+            vol = float(row.get("volume", row.get("VOLUME", 0)) or 0)
+            wallets = int(row.get("wallet_count", row.get("WALLET_COUNT", 0)) or 0)
+
+            if outcome == "yes":
+                yes_vol += vol
+                yes_wallets += wallets
+            elif outcome == "no":
+                no_vol += vol
+                no_wallets += wallets
+
+        total_vol = yes_vol + no_vol
+        total_wallets = yes_wallets + no_wallets
+
+        if total_vol == 0:
+            return None, 0.0, 0
+
+        if yes_vol > no_vol * 1.5:
+            return "up", total_vol, total_wallets
+        elif no_vol > yes_vol * 1.5:
+            return "down", total_vol, total_wallets
+
+        return None, total_vol, total_wallets
+
+    # ═══════════════════════════════════════════════
     #  MCP TRANSPORT LAYER
     # ═══════════════════════════════════════════════
 
