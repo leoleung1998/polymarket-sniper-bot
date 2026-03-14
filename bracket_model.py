@@ -212,7 +212,20 @@ def weather_bracket_prob(
 
         z_low = (bracket_low - 0.5 - forecast_temp) / std
         z_high = (bracket_high + 0.5 - forecast_temp) / std
-        return _norm_cdf(z_high) - _norm_cdf(z_low)
+        raw_prob = _norm_cdf(z_high) - _norm_cdf(z_low)
+
+        # ── Confidence discount for narrow brackets ──
+        # Single-degree ranges are very hard to hit — model overestimates
+        # Apply a discount to account for model uncertainty
+        bracket_width = bracket_high - bracket_low
+        if bracket_width <= 1:
+            # Single-degree (e.g., "exactly 17°C") — hardest to predict
+            return raw_prob * 0.6
+        elif bracket_width <= 3:
+            # Small range (e.g., "40-41°F", 2°F range) — still tricky
+            return raw_prob * 0.8
+        else:
+            return raw_prob
 
     else:
         return 0.5  # Unknown type

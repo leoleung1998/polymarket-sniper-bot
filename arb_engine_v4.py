@@ -1,6 +1,12 @@
 """
-Bracket Market Engine v4.0
+Bracket Market Engine v4.2
 Trades daily BTC/ETH price brackets and weather temperature brackets.
+
+v4.1 changes (limit order hybrid):
+- Posts GTC limit orders at model-fair price instead of FOK
+- Cancels and refreshes all open orders every scan cycle
+- Detects fills between cycles and records them in bankroll
+- Eliminates the "edge too thin at ask" problem — we make the market
 
 Unlike v3.5 (15-min latency arb), v4 uses:
 - Log-normal volatility model for crypto brackets
@@ -46,7 +52,7 @@ VPN_REQUIRED = os.getenv("PROTON_VPN_REQUIRED", "true").lower() == "true"
 
 # v4 Config
 V4_COINS = os.getenv("V4_COINS", "BTC,ETH").split(",")
-V4_MIN_EDGE = float(os.getenv("V4_MIN_EDGE", "0.05"))          # 5% minimum edge
+V4_MIN_EDGE = float(os.getenv("V4_MIN_EDGE", "0.15"))          # 15% minimum edge (raised from 5%)
 V4_SCAN_INTERVAL = int(os.getenv("V4_SCAN_INTERVAL", "300"))    # 5 min between scans
 V4_MAX_BET = float(os.getenv("V4_MAX_BET", "10.0"))             # Higher max for daily markets
 V4_MIN_BET = float(os.getenv("V4_MIN_BET", "2.0"))              # Higher floor
@@ -54,6 +60,14 @@ V4_KELLY_FRACTION = float(os.getenv("V4_KELLY_FRACTION", "0.10"))
 V4_DAILY_BANKROLL = float(os.getenv("V4_DAILY_BANKROLL", "50.0"))
 V4_MAX_ENTRY_PRICE = float(os.getenv("V4_MAX_ENTRY_PRICE", "0.80"))
 V4_MAX_TRADES_PER_EVENT = int(os.getenv("V4_MAX_TRADES_PER_EVENT", "1"))
+V4_MAX_WEATHER_PER_CYCLE = int(os.getenv("V4_MAX_WEATHER_PER_CYCLE", "3"))
+V4_MAX_CRYPTO_PER_CYCLE = int(os.getenv("V4_MAX_CRYPTO_PER_CYCLE", "3"))
+V4_MAX_OPEN_POSITIONS = int(os.getenv("V4_MAX_OPEN_POSITIONS", "6"))
+V4_MIN_HOURS_TO_RESOLUTION = float(os.getenv("V4_MIN_HOURS_TO_RESOLUTION", "6.0"))
+
+# Per-category edge thresholds — weather and crypto are different beasts
+V4_MIN_EDGE_WEATHER = float(os.getenv("V4_MIN_EDGE_WEATHER", "0.20"))  # 20% for weather (model uncertainty)
+V4_MIN_EDGE_CRYPTO = float(os.getenv("V4_MIN_EDGE_CRYPTO", "0.10"))    # 10% for crypto (vol model is tighter)
 
 # Logging
 LOG_DIR = Path("data")
@@ -89,7 +103,7 @@ class Bankroll:
     """Dynamic bankroll for daily bracket trading with downside protection."""
 
     # ── Circuit breaker thresholds ──
-    MAX_DRAWDOWN_PCT = 0.50       # Stop trading if 50% of starting bankroll lost
+    MAX_DRAWDOWN_PCT = 0.35       # Stop trading if 35% of starting bankroll lost
     LOSS_STREAK_LIMIT = 5         # Pause after 5 consecutive losses
     LOSS_STREAK_COOLDOWN = 1800   # 30 min cooldown after loss streak (seconds)
     MIN_WIN_RATE_TRADES = 10      # Start checking win rate after 10 trades
@@ -311,121 +325,229 @@ def kelly_bet_size(edge: float, buy_price: float, bankroll: float) -> float:
     return round(max(V4_MIN_BET, min(bet, V4_MAX_BET)), 2)
 
 
-# --- Orderbook + Trade Execution ---
+# --- Order Manager (v4.1 — hybrid limit orders) ---
 
-def get_best_ask(client, token_id: str) -> tuple[float, float] | None:
-    """Get best ask from CLOB orderbook."""
-    try:
-        book = client.get_order_book(token_id)
-        if not book.asks:
+@dataclass
+class OpenOrder:
+    """Tracks a live GTC limit order on the CLOB."""
+    order_id: str
+    token_id: str
+    score: BracketScore
+    limit_price: float
+    size: float
+    cost: float
+    event_slug: str
+    market_type: str
+    placed_at: float  # time.time()
+
+
+class OrderManager:
+    """
+    Manages GTC limit orders with cancel-and-refresh each scan cycle.
+
+    Flow each cycle:
+    1. Check which old orders filled (via get_orders — if missing, it filled)
+    2. Record fills in bankroll
+    3. Cancel all remaining open orders (stale prices)
+    4. Post fresh orders at updated model prices
+    """
+
+    def __init__(self):
+        self.open_orders: list[OpenOrder] = []
+
+    def check_fills_and_cancel(self, client, bankroll: Bankroll):
+        """
+        Check for fills since last cycle, then cancel all remaining open orders.
+        Returns number of fills detected.
+        """
+        if not self.open_orders:
+            return 0
+
+        fills = 0
+
+        # Get all currently open orders from CLOB
+        try:
+            live_orders = client.get_orders()
+            live_ids = {o.get("id", o.get("orderID", "")) for o in live_orders}
+        except Exception as e:
+            console.print(f"[yellow][v4] Could not fetch open orders: {e}[/yellow]")
+            # If we can't check, cancel everything to be safe
+            self._cancel_all_safe(client)
+            self.open_orders.clear()
+            return 0
+
+        # Check each tracked order — if not in live_ids, it filled (or was cancelled externally)
+        still_open = []
+        for order in self.open_orders:
+            if order.order_id not in live_ids:
+                # Order is gone from the book → filled!
+                fills += 1
+                msg = (
+                    f"✅ FILLED: {order.score.question[:50]} {order.score.best_side.upper()} "
+                    f"@ ${order.limit_price:.3f} | {order.size:.1f} shares | "
+                    f"${order.cost:.2f} USDC"
+                )
+                console.print(f"[bold green][v4] {msg}[/bold green]")
+                log_trade(msg)
+
+                # Record in bankroll
+                bankroll.place_bet(
+                    amount=order.cost,
+                    score=order.score,
+                    order_id=order.order_id,
+                    shares=order.size,
+                    event_slug=order.event_slug,
+                    market_type=order.market_type,
+                )
+
+                # Save to order history
+                placed = PlacedOrder(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    event_title=order.event_slug,
+                    market_question=order.score.question,
+                    outcome=order.score.best_side.upper(),
+                    price=order.limit_price,
+                    size=order.size,
+                    usdc_spent=order.cost,
+                    token_id=order.token_id,
+                    order_id=order.order_id,
+                    status="filled",
+                )
+                save_order(placed)
+            else:
+                still_open.append(order)
+
+        # Cancel all remaining open orders (stale prices)
+        if still_open:
+            cancel_ids = [o.order_id for o in still_open]
+            try:
+                client.cancel_orders(cancel_ids)
+                console.print(f"[dim][v4] Cancelled {len(cancel_ids)} stale orders[/dim]")
+            except Exception as e:
+                console.print(f"[yellow][v4] Cancel failed, trying cancel_all: {e}[/yellow]")
+                self._cancel_all_safe(client)
+
+        # Telegram notification on cycle reset
+        if fills or still_open:
+            parts = []
+            if fills:
+                parts.append(f"🎯 {fills} filled")
+            if still_open:
+                parts.append(f"🔄 {len(still_open)} cancelled")
+            tg.send_message(f"📋 Order cycle reset: {' | '.join(parts)}\nBankroll: ${bankroll.balance:.2f}")
+
+        self.open_orders.clear()
+        return fills
+
+    def post_limit_order(self, client, score: BracketScore, bankroll: Bankroll,
+                         event_slug: str = "", market_type: str = "") -> OpenOrder | None:
+        """Post a GTC limit order at our model-fair bid price."""
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY
+
+        MIN_SHARES = 5
+
+        # Our bid price = model_prob - fee - small buffer
+        # We want to buy at a price where we still have edge
+        model_prob = score.model_prob_yes if score.best_side == "yes" else (1 - score.model_prob_yes)
+
+        # Bid at model_prob minus fee minus 2% buffer (keeps ~2% edge minimum)
+        bid_price = round(model_prob - POLYMARKET_FEE - 0.02, 2)
+
+        # Clamp to valid range
+        bid_price = max(0.01, min(bid_price, V4_MAX_ENTRY_PRICE))
+
+        # Don't bid above the current mid-price (don't overpay)
+        mid_price = score.buy_price
+        if bid_price > mid_price and mid_price > 0.01:
+            # Bid at mid-price — still has edge since model_prob > mid + fee
+            bid_price = round(mid_price, 2)
+
+        # Verify we still have edge at our bid
+        edge_at_bid = model_prob - bid_price - POLYMARKET_FEE
+        if edge_at_bid < V4_MIN_EDGE:
             return None
-        best = book.asks[0]
-        return (float(best.price), float(best.size))
-    except Exception:
-        return None
 
+        # Kelly sizing at our bid price
+        bet_amt = kelly_bet_size(edge_at_bid, bid_price, bankroll.balance)
 
-def execute_bracket_trade(client, score: BracketScore, bankroll: Bankroll,
-                          event_slug: str = "", market_type: str = "") -> PlacedOrder | None:
-    """Execute a bracket trade on Polymarket CLOB."""
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY
+        raw_size = bet_amt / bid_price
+        size = max(MIN_SHARES, math.floor(raw_size * 100) / 100)
+        actual_cost = bid_price * size
 
-    MIN_SHARES = 5
+        # Don't exceed remaining bankroll
+        if actual_cost > bankroll.balance:
+            size = math.floor((bankroll.balance / bid_price) * 100) / 100
+            if size < MIN_SHARES:
+                return None
+            actual_cost = bid_price * size
 
-    # Get real best ask
-    best = get_best_ask(client, score.token_id)
-    if best is None:
-        console.print(f"[dim][v4] No asks on book for {score.question[:50]}[/dim]")
-        return None
+        try:
+            order_args = OrderArgs(
+                token_id=score.token_id,
+                price=bid_price,
+                size=size,
+                side=BUY,
+            )
+            signed_order = client.create_order(order_args)
+            response = client.post_order(signed_order, OrderType.GTC)
 
-    best_ask_price, best_ask_size = best
+            order_id = ""
+            if isinstance(response, dict):
+                order_id = response.get("orderID", response.get("id", ""))
+                success = response.get("success", True)
+            else:
+                order_id = str(response)
+                success = True
 
-    # Recalculate edge at real ask
-    model_prob = score.model_prob_yes if score.best_side == "yes" else (1 - score.model_prob_yes)
-    real_edge = model_prob - best_ask_price - POLYMARKET_FEE
+            if not success:
+                console.print(f"[red][v4] Order rejected: {response}[/red]")
+                log_trade(f"REJECTED: {score.question[:50]} | {response}")
+                return None
 
-    if real_edge < V4_MIN_EDGE:
-        console.print(
-            f"[dim][v4] Edge too thin at ask: {real_edge:.1%} "
-            f"(mid: {score.best_edge:.1%}) | Ask: ${best_ask_price:.3f}[/dim]"
-        )
-        return None
+            open_order = OpenOrder(
+                order_id=order_id,
+                token_id=score.token_id,
+                score=score,
+                limit_price=bid_price,
+                size=size,
+                cost=actual_cost,
+                event_slug=event_slug,
+                market_type=market_type,
+                placed_at=time.time(),
+            )
+            self.open_orders.append(open_order)
 
-    if best_ask_price > V4_MAX_ENTRY_PRICE:
-        console.print(f"[dim][v4] Ask ${best_ask_price:.3f} > max entry ${V4_MAX_ENTRY_PRICE}[/dim]")
-        return None
+            msg = (
+                f"📋 BID: {score.question[:50]} {score.best_side.upper()} "
+                f"@ ${bid_price:.3f} | {size:.1f} shares | "
+                f"Edge: {edge_at_bid:.1%} | ${actual_cost:.2f}"
+            )
+            console.print(f"[cyan][v4] {msg}[/cyan]")
+            log_trade(msg)
 
-    # Kelly sizing
-    bet_amt = kelly_bet_size(real_edge, best_ask_price, bankroll.balance)
+            return open_order
 
-    # Limit price: 1¢ above best ask
-    limit_price = min(round(best_ask_price + 0.01, 2), 0.99)
-    raw_size = bet_amt / limit_price
-    size = max(MIN_SHARES, math.floor(raw_size * 100) / 100)
-    actual_cost = limit_price * size
-
-    try:
-        order_args = OrderArgs(
-            token_id=score.token_id,
-            price=limit_price,
-            size=size,
-            side=BUY,
-        )
-        signed_order = client.create_order(order_args)
-        response = client.post_order(signed_order, OrderType.FOK)
-
-        order_id = ""
-        if isinstance(response, dict):
-            order_id = response.get("orderID", response.get("id", ""))
-            success = response.get("success", True)
-        else:
-            order_id = str(response)
-            success = True
-
-        if not success:
-            console.print(f"[red][v4] Order rejected: {response}[/red]")
-            log_trade(f"REJECTED: {score.question[:50]} | {response}")
+        except Exception as e:
+            console.print(f"[red][v4] Limit order failed: {e}[/red]")
+            log_trade(f"ERROR: {score.question[:50]} | {e}")
             return None
 
-        placed = PlacedOrder(
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            event_title=event_slug,
-            market_question=score.question,
-            outcome=score.best_side.upper(),
-            price=limit_price,
-            size=size,
-            usdc_spent=actual_cost,
-            token_id=score.token_id,
-            order_id=order_id,
-            status="filled",
-        )
+    def _cancel_all_safe(self, client):
+        """Fallback: cancel all orders for this account."""
+        try:
+            client.cancel_all()
+        except Exception as e:
+            console.print(f"[red][v4] cancel_all failed: {e}[/red]")
 
-        msg = (
-            f"TRADE: {score.question[:50]} {score.best_side.upper()} "
-            f"@ ${limit_price:.3f} | {size} shares | "
-            f"Edge: {real_edge:.1%} | ${actual_cost:.2f} USDC"
-        )
-        console.print(f"[bold green][v4] {msg}[/bold green]")
-        log_trade(msg)
-        save_order(placed)
+    @property
+    def total_locked(self) -> float:
+        """Total USDC locked in open orders."""
+        return sum(o.cost for o in self.open_orders)
 
-        # Record in bankroll
-        bankroll.place_bet(
-            amount=actual_cost,
-            score=score,
-            order_id=order_id,
-            shares=size,
-            event_slug=event_slug,
-            market_type=market_type,
-        )
-
-        return placed
-
-    except Exception as e:
-        console.print(f"[red][v4] Trade failed: {e}[/red]")
-        log_trade(f"ERROR: {score.question[:50]} | {e}")
-        return None
+    @property
+    def count(self) -> int:
+        return len(self.open_orders)
 
 
 # --- Scoring Engine ---
@@ -497,19 +619,22 @@ def score_weather_event(event: BracketEvent, forecast: CityForecast) -> list[Bra
 async def run_bracket_bot():
     """Main v4 bracket bot loop."""
     console.print("[bold cyan]" + "=" * 60 + "[/bold cyan]")
-    console.print("[bold cyan]  Polymarket Bracket Bot v4.0[/bold cyan]")
+    console.print("[bold cyan]  Polymarket Bracket Bot v4.2[/bold cyan]")
     console.print("[bold cyan]  Weather + BTC/ETH Daily Brackets[/bold cyan]")
     console.print("[bold cyan]" + "=" * 60 + "[/bold cyan]")
     console.print()
 
     # Config display
     console.print(f"  Coins:           {', '.join(V4_COINS)}")
-    console.print(f"  Min edge:        {V4_MIN_EDGE:.0%}")
+    console.print(f"  Min edge:        {V4_MIN_EDGE_CRYPTO:.0%} crypto / {V4_MIN_EDGE_WEATHER:.0%} weather")
     console.print(f"  Scan interval:   {V4_SCAN_INTERVAL}s")
     console.print(f"  Bet range:       ${V4_MIN_BET:.0f}-${V4_MAX_BET:.0f}")
     console.print(f"  Daily bankroll:  ${V4_DAILY_BANKROLL:.0f}")
     console.print(f"  Kelly fraction:  {V4_KELLY_FRACTION:.0%}")
     console.print(f"  Max entry:       ${V4_MAX_ENTRY_PRICE}")
+    console.print(f"  Max positions:   {V4_MAX_OPEN_POSITIONS} total ({V4_MAX_WEATHER_PER_CYCLE}W/{V4_MAX_CRYPTO_PER_CYCLE}C per cycle)")
+    console.print(f"  Skip if <{V4_MIN_HOURS_TO_RESOLUTION:.0f}h to resolution")
+    console.print(f"  Drawdown limit:  {Bankroll.MAX_DRAWDOWN_PCT:.0%}")
     console.print()
 
     # VPN check
@@ -568,6 +693,9 @@ async def run_bracket_bot():
         console.print(f"  {coin} volatility: {vol:.1%} annualized")
     console.print()
 
+    # Order manager (v4.1 — hybrid limit orders)
+    order_mgr = OrderManager()
+
     # Main loop
     scan_count = 0
 
@@ -575,9 +703,14 @@ async def run_bracket_bot():
         try:
             scan_count += 1
             now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            console.print(f"[bold]── Scan #{scan_count} @ {now_str} ──[/bold]")
+
+            # ── 0. Check fills + cancel stale orders ──
+            fills = order_mgr.check_fills_and_cancel(client, bankroll)
+            if fills:
+                console.print(f"  [bold green]🎯 {fills} order(s) filled since last scan![/bold green]")
 
             # ── 1. Discover events ──
-            console.print(f"[bold]── Scan #{scan_count} @ {now_str} ──[/bold]")
             events = discover_all_events(V4_COINS)
 
             crypto_events = [e for e in events if e.market_type == "crypto"]
@@ -632,11 +765,14 @@ async def run_bracket_bot():
                     all_scores.append((s, event))
 
             # ── 3. Find best opportunities ──
-            # Sort by edge descending
             all_scores.sort(key=lambda x: x[0].best_edge, reverse=True)
 
-            # Show top opportunities
-            tradeable = [(s, e) for s, e in all_scores if s.best_edge >= V4_MIN_EDGE]
+            # Per-category edge thresholds — weather needs higher edge due to model uncertainty
+            tradeable = []
+            for s, e in all_scores:
+                min_edge = V4_MIN_EDGE_WEATHER if e.market_type == "weather" else V4_MIN_EDGE_CRYPTO
+                if s.best_edge >= min_edge:
+                    tradeable.append((s, e))
             if tradeable:
                 console.print(f"\n  [green]📊 {len(tradeable)} opportunities with edge ≥ {V4_MIN_EDGE:.0%}:[/green]")
                 for s, e in tradeable[:10]:
@@ -651,50 +787,97 @@ async def run_bracket_bot():
             else:
                 console.print(f"  [dim]No edges ≥ {V4_MIN_EDGE:.0%} found[/dim]")
 
-            # ── 4. Execute trades ──
+            # ── 4. Post fresh limit orders ──
+            orders_posted = 0
             if bankroll.can_trade and tradeable:
+                # Budget for this cycle: don't lock more than remaining bankroll
+                cycle_budget = bankroll.balance
+                cycle_spent = 0.0
+
+                # Category counters — enforce diversification
+                weather_count = 0
+                crypto_count = 0
+                total_open = len(bankroll.pending_trades)  # Already-filled positions
+
                 for score, event in tradeable:
                     if not bankroll.can_trade:
                         break
+                    if cycle_spent >= cycle_budget * 0.80:  # Keep 20% reserve
+                        break
 
-                    # Skip if already traded this market
+                    # ── Position limits ──
+                    if total_open + orders_posted >= V4_MAX_OPEN_POSITIONS:
+                        console.print(f"  [yellow]Max {V4_MAX_OPEN_POSITIONS} open positions reached[/yellow]")
+                        break
+
+                    # Per-category limits
+                    if event.market_type == "weather" and weather_count >= V4_MAX_WEATHER_PER_CYCLE:
+                        continue
+                    if event.market_type == "crypto" and crypto_count >= V4_MAX_CRYPTO_PER_CYCLE:
+                        continue
+
+                    # ── Skip markets resolving too soon (adverse selection risk) ──
+                    market_hours = min(
+                        (m.hours_remaining for m in event.markets if m.is_active),
+                        default=24
+                    )
+                    if market_hours < V4_MIN_HOURS_TO_RESOLUTION:
+                        continue
+
+                    # Skip if already traded this market (filled in a previous cycle)
                     if bankroll.already_traded(score.slug):
                         continue
 
-                    # Skip if already traded this event (max 1 per event)
+                    # Skip if already traded this event (max per event)
                     event_traded = sum(1 for s in bankroll.traded_slugs
                                        if any(m.slug == s for m in event.markets))
                     if event_traded >= V4_MAX_TRADES_PER_EVENT:
                         continue
 
-                    # Execute!
-                    result = execute_bracket_trade(
+                    # Post limit order
+                    order = order_mgr.post_limit_order(
                         client, score, bankroll,
                         event_slug=event.slug,
                         market_type=event.market_type,
                     )
 
-                    if result:
-                        console.print(f"  [bold green]✅ Trade placed![/bold green]")
+                    if order:
+                        orders_posted += 1
+                        cycle_spent += order.cost
+                        if event.market_type == "weather":
+                            weather_count += 1
+                        else:
+                            crypto_count += 1
+
+                if orders_posted:
+                    console.print(
+                        f"  [cyan]📋 {orders_posted} limit orders posted "
+                        f"({weather_count}W/{crypto_count}C) | "
+                        f"${order_mgr.total_locked:.2f} USDC on book[/cyan]"
+                    )
 
             # ── 5. Check resolutions ──
             if bankroll.pending_trades:
                 bankroll.check_pending_resolutions(client)
 
             # ── 6. Status ──
-            console.print(f"\n  {bankroll.status_line()}")
+            open_str = f" | Open: {order_mgr.count}" if order_mgr.count else ""
+            console.print(f"\n  {bankroll.status_line()}{open_str}")
             console.print()
 
             # ── 7. Sleep until next scan ──
             await asyncio.sleep(V4_SCAN_INTERVAL)
 
         except KeyboardInterrupt:
-            console.print("\n[yellow]Bot stopped by user[/yellow]")
+            # Clean up: cancel all open orders on exit
+            console.print("\n[yellow]Cancelling open orders...[/yellow]")
+            order_mgr._cancel_all_safe(client)
+            console.print("[yellow]Bot stopped by user[/yellow]")
             break
         except Exception as e:
             console.print(f"[red]Error in main loop: {e}[/red]")
             log_trade(f"ERROR: Main loop: {e}")
-            await asyncio.sleep(60)  # Wait a minute on error
+            await asyncio.sleep(60)
 
 
 def main():

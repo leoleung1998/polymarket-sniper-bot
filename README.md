@@ -179,9 +179,10 @@ polymarket-sniper-bot/
    - Crypto: Log-normal model with Binance hourly volatility
    - Weather: Normal distribution around NOAA/Open-Meteo forecast
 3. **Score** — Compares model probability vs Polymarket price for each bracket. Edge = model_prob - poly_price - 2% fee
-4. **Trade** — When edge > 5%, verifies with real CLOB orderbook, places Fill-or-Kill order
-5. **Protect** — Circuit breakers halt trading on drawdown, loss streaks, or low win rate
-6. **Resolve** — Next day, checks if bracket hit or missed, updates bankroll
+4. **Trade** — When edge > 5%, posts GTC limit orders at model-fair price. Acts as market maker instead of paying the spread
+5. **Refresh** — Every scan cycle (5 min), cancels stale orders and posts fresh ones at updated prices. Detects fills and records them. Sends Telegram alerts on every cycle reset
+6. **Protect** — Circuit breakers halt trading on drawdown, loss streaks, or low win rate
+7. **Resolve** — Next day, checks if bracket hit or missed, updates bankroll
 
 ## Support This Project
 
