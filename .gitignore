@@ -1,5 +1,9 @@
 .env
+.env.local
+.env.production
 __pycache__/
 *.pyc
 data/
 logs/
+*.out
+*.log
