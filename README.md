@@ -56,7 +56,7 @@ Open `.env` in any editor and fill in your credentials (see below).
 
 ### Step 3: Get your Polymarket private key
 
-1. Go to [polymarket.com](https://polymarket.com)
+1. Go to [polymarket.com](https://polymarket.com) and create an account (deposit at least $20 USDC)
 2. Click your profile icon (top right) > **Cash** > **...** (three dots) > **Export Private Key**
 3. Paste it as `PRIVATE_KEY` in your `.env`
 4. Your wallet address is shown on the same page — paste as `WALLET_ADDRESS`
@@ -182,6 +182,18 @@ polymarket-sniper-bot/
 4. **Trade** — When edge > 5%, verifies with real CLOB orderbook, places Fill-or-Kill order
 5. **Protect** — Circuit breakers halt trading on drawdown, loss streaks, or low win rate
 6. **Resolve** — Next day, checks if bracket hit or missed, updates bankroll
+
+## Support This Project
+
+If this bot makes you money, consider tipping the developer:
+
+**Polygon/Ethereum:** `0x297593a37c7CE7368AB822e6369D90BFC01B0da8`
+
+## Helpful Links
+
+- [Sign up for Polymarket](https://polymarket.com) — *replace with your referral link from [partners.dub.co/polymarket](https://partners.dub.co/polymarket)*
+- [Get ProtonVPN](https://proton.me/refer-a-friend) — *replace with your referral link from [proton.me/refer-a-friend](https://proton.me/refer-a-friend)*
+- [Allium Data Platform](https://app.allium.so) — On-chain intelligence (optional)
 
 ## Disclaimer
 
