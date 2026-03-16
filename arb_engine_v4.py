@@ -61,7 +61,7 @@ V4_MAX_ENTRY_PRICE = float(os.getenv("V4_MAX_ENTRY_PRICE", "0.80"))
 V4_MAX_TRADES_PER_EVENT = int(os.getenv("V4_MAX_TRADES_PER_EVENT", "1"))
 V4_MAX_WEATHER_PER_CYCLE = int(os.getenv("V4_MAX_WEATHER_PER_CYCLE", "6"))
 V4_MAX_OPEN_POSITIONS = int(os.getenv("V4_MAX_OPEN_POSITIONS", "6"))
-V4_MIN_HOURS_TO_RESOLUTION = float(os.getenv("V4_MIN_HOURS_TO_RESOLUTION", "6.0"))
+V4_MIN_HOURS_TO_RESOLUTION = float(os.getenv("V4_MIN_HOURS_TO_RESOLUTION", "2.0"))
 
 # Edge threshold — ensemble model is more reliable than single forecast
 V4_MIN_EDGE_WEATHER = float(os.getenv("V4_MIN_EDGE_WEATHER", "0.08"))  # 8% for weather (GFS ensemble)
