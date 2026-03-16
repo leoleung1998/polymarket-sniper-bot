@@ -325,11 +325,16 @@ class WindowState:
 
     @property
     def seconds_remaining(self) -> int:
-        return max(0, self.window_end_ts - int(time.time()))
+        return self.window_end_ts - int(time.time())
 
     @property
     def is_active(self) -> bool:
         return self.seconds_remaining > 0
+
+    @property
+    def needs_resolution(self) -> bool:
+        """Window closed and has an unresolved order."""
+        return self.order_placed and self.order_info is not None and self.seconds_remaining <= 0
 
 
 # --- Main Loop ---
@@ -381,6 +386,7 @@ async def run_maker_bot():
 
     # Track windows per coin
     windows: dict[str, WindowState] = {}
+    prev_windows: dict[str, WindowState] = {}  # Previous windows awaiting resolution
 
     console.print("[green]Maker bot started. Monitoring 15-min windows...[/green]")
     console.print()
@@ -398,11 +404,58 @@ async def run_maker_bot():
 
                 # Check if we need a new window state
                 window = windows.get(coin)
+
+                # Resolve previous window before starting a new one
+                prev = prev_windows.get(coin)
+                if prev and prev.needs_resolution:
+                    order = prev.order_info
+                    filled = await check_if_filled(client, order["order_id"])
+                    if filled:
+                        console.print(f"  [green]✅ {coin} maker order FILLED![/green]")
+                        save_trade_record({
+                            "type": "maker_fill", "coin": coin,
+                            "direction": order["direction"], "bid_price": order["bid_price"],
+                            "size": order["size"], "cost": order["cost"],
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                        # Check resolution — did we win or lose?
+                        try:
+                            from tracker import get_current_price
+                            token_price = get_current_price(order["token_id"])
+                            if token_price is not None and token_price >= 0.90:
+                                payout = order["size"] * 1.0
+                                bankroll.record_win(order["cost"], payout)
+                                console.print(f"  [bold green]🎯 {coin} WIN! +${payout - order['cost']:.2f}[/bold green]")
+                                tg.send_message(f"🎯 MAKER WIN\n{coin} {order['direction'].upper()}\n+${payout - order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
+                            elif token_price is not None and token_price <= 0.10:
+                                bankroll.record_loss(order["cost"])
+                                console.print(f"  [red]❌ {coin} LOSS: -${order['cost']:.2f}[/red]")
+                                tg.send_message(f"❌ MAKER LOSS\n{coin} {order['direction'].upper()}\n-${order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
+                            else:
+                                # Not resolved yet — give the money back for now
+                                console.print(f"  [yellow]{coin}: Resolution unclear (price: {token_price}) — refunding[/yellow]")
+                                bankroll.balance += order["cost"]
+                        except Exception as e:
+                            console.print(f"  [yellow]{coin}: Resolution check failed ({e}) — refunding[/yellow]")
+                            bankroll.balance += order["cost"]
+                        bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") != order["order_id"]]
+                    else:
+                        # Not filled — cancel and refund
+                        await cancel_order(client, order["order_id"])
+                        bankroll.balance += order["cost"]
+                        console.print(f"  [dim]{coin}: Order not filled — cancelled (refunded ${order['cost']:.2f})[/dim]")
+                        bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") != order["order_id"]]
+                    prev.order_info = None  # Mark resolved
+                    del prev_windows[coin]
+
                 if window is None or window.window_start_ts != current_window_start:
+                    # Save old window for resolution
+                    if window and window.order_info:
+                        prev_windows[coin] = window
+
                     # New window — record start price
                     start_price = feed.get_price(coin) or 0
                     if start_price > 0:
-                        # Also set it in the feed for momentum tracking
                         feed.set_window_start(coin, start_price)
 
                     window = WindowState(
@@ -417,7 +470,7 @@ async def run_maker_bot():
                     console.print(
                         f"[bold]── {coin} New window: {ts} UTC | "
                         f"Start: ${start_price:,.2f} | "
-                        f"{window.seconds_remaining}s remaining ──[/bold]"
+                        f"{max(0, window.seconds_remaining)}s remaining ──[/bold]"
                     )
 
                 # ── Check if it's time to enter (T-10 seconds) ──
@@ -475,102 +528,6 @@ async def run_maker_bot():
                         bankroll.balance -= order_info["cost"]
                         bankroll.pending_orders.append(order_info)
 
-                # ── Check for fills and resolution after window closes ──
-                if (
-                    window.order_placed
-                    and window.order_info
-                    and not window.filled
-                    and secs_left <= 0
-                ):
-                    order = window.order_info
-
-                    # Check if the order filled
-                    filled = await check_if_filled(client, order["order_id"])
-
-                    if filled:
-                        window.filled = True
-                        console.print(f"  [green]✅ {coin} maker order FILLED![/green]")
-
-                        # Wait a bit for resolution (15-min markets resolve quickly)
-                        # Resolution is usually within 1-2 minutes after window close
-                        # We'll check on the next loop iteration
-
-                        save_trade_record({
-                            "type": "maker_fill",
-                            "coin": coin,
-                            "direction": order["direction"],
-                            "bid_price": order["bid_price"],
-                            "size": order["size"],
-                            "cost": order["cost"],
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        })
-                    else:
-                        # Order didn't fill — cancel it and get money back
-                        cancelled = await cancel_order(client, order["order_id"])
-                        if cancelled:
-                            bankroll.balance += order["cost"]  # Refund
-                            console.print(f"  [dim]{coin}: Order not filled — cancelled (refunded ${order['cost']:.2f})[/dim]")
-                        window.filled = True  # Mark as handled
-
-                        # Remove from pending
-                        bankroll.pending_orders = [
-                            o for o in bankroll.pending_orders
-                            if o.get("order_id") != order["order_id"]
-                        ]
-
-                # ── Check resolution of filled orders (a few minutes after window close) ──
-                if (
-                    window.filled
-                    and window.order_info
-                    and secs_left <= -120  # Check 2 minutes after close
-                ):
-                    order = window.order_info
-                    # Check resolution by looking at token price
-                    try:
-                        from tracker import get_current_price
-                        token_price = get_current_price(order["token_id"])
-
-                        if token_price is not None:
-                            if token_price >= 0.90:
-                                # Won!
-                                payout = order["size"] * 1.0
-                                bankroll.record_win(order["cost"], payout)
-                                console.print(
-                                    f"  [bold green]🎯 {coin} WIN! "
-                                    f"Bet ${order['cost']:.2f} → Payout ${payout:.2f} "
-                                    f"(+${payout - order['cost']:.2f})[/bold green]"
-                                )
-                                tg.send_message(
-                                    f"🎯 MAKER WIN\n{coin} {order['direction'].upper()}\n"
-                                    f"+${payout - order['cost']:.2f}\n"
-                                    f"Bankroll: ${bankroll.balance:.2f}"
-                                )
-                                # Remove from pending
-                                bankroll.pending_orders = [
-                                    o for o in bankroll.pending_orders
-                                    if o.get("order_id") != order["order_id"]
-                                ]
-                                window.order_info = None  # Don't check again
-
-                            elif token_price <= 0.10:
-                                # Lost
-                                bankroll.record_loss(order["cost"])
-                                console.print(
-                                    f"  [red]❌ {coin} LOSS: -${order['cost']:.2f}[/red]"
-                                )
-                                tg.send_message(
-                                    f"❌ MAKER LOSS\n{coin} {order['direction'].upper()}\n"
-                                    f"-${order['cost']:.2f}\n"
-                                    f"Bankroll: ${bankroll.balance:.2f}"
-                                )
-                                bankroll.pending_orders = [
-                                    o for o in bankroll.pending_orders
-                                    if o.get("order_id") != order["order_id"]
-                                ]
-                                window.order_info = None
-
-                    except Exception as e:
-                        pass  # Resolution not ready yet, will check next loop
 
             # ── Clean up stale pending orders (older than 20 minutes) ──
             stale_cutoff = time.time() - 1200  # 20 minutes ago
