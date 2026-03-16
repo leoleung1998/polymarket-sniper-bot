@@ -153,24 +153,39 @@ def tool_bot_status() -> str:
         except Exception:
             lines.append(f"⚪ {label}: Unknown")
 
-    # Get last few log lines for context
-    try:
-        log_result = subprocess.run(
-            ["sudo", "journalctl", "-u", "polymarket-bot", "--no-pager", "-n", "5"],
-            capture_output=True, text=True, timeout=5
-        )
-        last_lines = log_result.stdout.strip().split("\n")
-        # Find the bankroll/P&L line
-        for line in reversed(last_lines):
-            if "Bankroll:" in line and "P&L:" in line:
-                # Extract the status part
-                parts = line.split("Bankroll:", 1)[-1].strip()
-                lines.append(f"\n💰 Bankroll: {parts.split('|')[0].strip()}")
-                for p in parts.split("|")[1:]:
-                    lines.append(f"   {p.strip()}")
-                break
-    except Exception:
-        pass
+    # Separate scoreboards for each bot
+    for service, header in [("polymarket-bot", "🌤️ WEATHER SCOREBOARD"), ("crypto-maker", "📈 CRYPTO SCOREBOARD")]:
+        try:
+            log_result = subprocess.run(
+                ["sudo", "journalctl", "-u", service, "--no-pager", "-n", "20"],
+                capture_output=True, text=True, timeout=5
+            )
+            log_lines = log_result.stdout.strip().split("\n")
+            bankroll_info = None
+            for log_line in reversed(log_lines):
+                if "Bankroll:" in log_line and "P&L:" in log_line:
+                    bankroll_info = log_line.split("Bankroll:", 1)[-1].strip()
+                    break
+
+            lines.append(f"\n{header}")
+            if bankroll_info:
+                for part in bankroll_info.split("|"):
+                    part = part.strip()
+                    if part.startswith("$") or part.startswith("-$"):
+                        lines.append(f"  💰 Bankroll: {part}")
+                    elif "P&L" in part:
+                        lines.append(f"  📊 {part}")
+                    elif "W/L" in part:
+                        lines.append(f"  🎯 {part}")
+                    elif "Pending" in part:
+                        lines.append(f"  ⏳ {part}")
+                    else:
+                        lines.append(f"  💰 Bankroll: {part}")
+            else:
+                lines.append("  No data yet")
+        except Exception:
+            lines.append(f"\n{header}")
+            lines.append("  Could not read logs")
 
     return "\n".join(lines) if lines else "Could not get status"
 
