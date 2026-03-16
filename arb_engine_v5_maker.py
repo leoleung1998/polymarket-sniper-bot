@@ -5,21 +5,22 @@ The taker arbitrage strategy (v3.5) is dead — Polymarket's Feb 2026 dynamic fe
 (up to 3.15%) and removal of the 500ms delay killed it.
 
 NEW STRATEGY: Post GTC maker limit orders on the likely winning side of 15-min
-BTC/ETH up/down markets, ~10 seconds before window close.
+BTC/ETH/SOL up/down markets, ~2 minutes before window close.
 
 Why it works:
-- ~85% of BTC price direction is determined by T-10 seconds
+- ~85% of price direction is locked in by T-2 minutes
 - Polymarket odds don't fully reflect this (slow to update near close)
+- 2 minutes gives enough time for orders to fill (T-10s was too fast)
 - Zero taker fees + maker rebates on GTC orders
 - High win rate (target: 80%+) with small per-trade profit ($0.05-0.10/share)
 
 Flow:
-1. Connect to Binance WebSocket for real-time BTC/ETH prices
+1. Connect to Binance WebSocket for real-time BTC/ETH/SOL prices
 2. At each 15-min window, track price from window start
-3. At T-10 seconds before close:
+3. At T-120 seconds (2 min) before close:
    a. Check Binance price vs window open price
-   b. If BTC clearly up (>0.1%): post maker bid for UP at $0.90-0.95
-   c. If BTC clearly down (<-0.1%): post maker bid for DOWN at $0.90-0.95
+   b. If coin clearly up (>0.1%): post maker bid for UP at $0.88-0.95
+   c. If coin clearly down (<-0.1%): post maker bid for DOWN at $0.88-0.95
    d. If ambiguous: skip (don't bet on coin flips)
 4. At T-0: cancel unfilled orders
 5. Wait for resolution, collect $1.00/share on wins
@@ -70,7 +71,7 @@ MAKER_DAILY_LOSS_LIMIT = float(os.getenv("MAKER_DAILY_LOSS_LIMIT", "25.0"))
 MAKER_MIN_MOVE_PCT = float(os.getenv("MAKER_MIN_MOVE_PCT", "0.10"))   # 0.1% min price move
 MAKER_BID_PRICE_LOW = float(os.getenv("MAKER_BID_PRICE_LOW", "0.88"))  # Bid range low
 MAKER_BID_PRICE_HIGH = float(os.getenv("MAKER_BID_PRICE_HIGH", "0.95"))  # Bid range high
-MAKER_ENTRY_SECONDS = int(os.getenv("MAKER_ENTRY_SECONDS", "10"))     # Enter at T-10s
+MAKER_ENTRY_SECONDS = int(os.getenv("MAKER_ENTRY_SECONDS", "120"))    # Enter at T-120s (2 min before close)
 MAKER_LOSS_STREAK_LIMIT = int(os.getenv("MAKER_LOSS_STREAK_LIMIT", "3"))
 MAKER_LOSS_COOLDOWN = int(os.getenv("MAKER_LOSS_COOLDOWN", "3600"))    # 1 hour
 

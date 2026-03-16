@@ -14,7 +14,7 @@ Automated trading bot for Polymarket prediction markets. Three strategies, one c
 ## The Three Strategies
 
 1. **Weather Bracket Bot** — Trades daily weather temperature brackets using the GFS 31-member ensemble forecast. Counts how many ensemble members land in each bracket to compute probability. Buys when edge > 8%.
-2. **Crypto Maker Bot** — Trades 15-min BTC/ETH/SOL up/down markets. Posts GTC limit orders at $0.88-0.95 on the likely winning side ~10 seconds before window close. Zero taker fees + maker rebates.
+2. **Crypto Maker Bot** — Trades 15-min BTC/ETH/SOL up/down markets. Posts GTC limit orders at $0.88-0.95 on the likely winning side 2 minutes before window close. Zero taker fees + maker rebates.
 3. **Sniper** — Buys outcomes priced under 3 cents. High volume, low cost, lottery-ticket math.
 
 ---
@@ -159,12 +159,12 @@ Trades 15-minute BTC/ETH/SOL "Up or Down" markets using a maker (limit order) st
 **The new strategy:**
 1. Connects to Binance WebSocket for real-time BTC/ETH/SOL prices
 2. Tracks price from the start of each 15-min window
-3. At T-10 seconds before window close: checks if price has moved >0.1% in one direction
+3. At T-120 seconds (2 min) before window close: checks if price has moved >0.1% in one direction
 4. If direction is clear → posts GTC maker bid at $0.88-0.95 on the likely winning side
 5. If ambiguous (< 0.1% move) → skips (don't bet on coin flips)
-6. After window close: if order didn't fill, cancel it. If filled, collect $1.00/share on win.
+6. 2 minutes on the orderbook gives time for fills. After window close: collect $1.00/share on wins.
 
-**Why this works:** ~85% of 15-min price direction is determined by T-10 seconds. Polymarket odds update slowly near close. Maker orders = zero fees + rebates.
+**Why this works:** ~85% of 15-min price direction is locked in by the last 2 minutes. Polymarket odds update slowly near close. Maker orders = zero fees + rebates. T-120s gives enough time for orders to actually fill (T-10s was too fast).
 
 ### Sniper Mode (`python bot.py scan` / `run`)
 
@@ -214,7 +214,7 @@ All settings are in `.env`. Defaults work out of the box — only `PRIVATE_KEY` 
 | `MAKER_MIN_MOVE_PCT` | `0.10` | Min price move to bet (0.1%) |
 | `MAKER_BID_PRICE_LOW` | `0.88` | Bid price for low-confidence trades |
 | `MAKER_BID_PRICE_HIGH` | `0.95` | Bid price for high-confidence trades |
-| `MAKER_ENTRY_SECONDS` | `10` | Enter at T-10 seconds before close |
+| `MAKER_ENTRY_SECONDS` | `120` | Enter at T-120s (2 min) before close |
 | `MAKER_LOSS_STREAK_LIMIT` | `3` | Pause after 3 consecutive losses |
 | `MAKER_LOSS_COOLDOWN` | `3600` | Cooldown after loss streak (seconds) |
 
