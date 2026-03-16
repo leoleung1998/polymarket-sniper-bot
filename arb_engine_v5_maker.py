@@ -572,6 +572,27 @@ async def run_maker_bot():
                     except Exception as e:
                         pass  # Resolution not ready yet, will check next loop
 
+            # ── Clean up stale pending orders (older than 20 minutes) ──
+            stale_cutoff = time.time() - 1200  # 20 minutes ago
+            stale_orders = [
+                o for o in bankroll.pending_orders
+                if o.get("placed_at", time.time()) < stale_cutoff
+            ]
+            for stale in stale_orders:
+                # Try to cancel on Polymarket (may already be gone)
+                try:
+                    await cancel_order(client, stale["order_id"])
+                except Exception:
+                    pass
+                # Refund the cost back to bankroll
+                bankroll.balance += stale.get("cost", 0)
+                console.print(f"  [yellow]🧹 Cleaned up stale order: {stale.get('coin', '?')} — refunded ${stale.get('cost', 0):.2f}[/yellow]")
+            if stale_orders:
+                bankroll.pending_orders = [
+                    o for o in bankroll.pending_orders
+                    if o not in stale_orders
+                ]
+
             # Print status periodically
             if now % 60 == 0:
                 console.print(f"  {bankroll.status_line()}")
