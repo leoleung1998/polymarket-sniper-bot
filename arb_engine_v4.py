@@ -67,8 +67,8 @@ V4_MIN_HOURS_TO_RESOLUTION = float(os.getenv("V4_MIN_HOURS_TO_RESOLUTION", "6.0"
 V4_MIN_EDGE_WEATHER = float(os.getenv("V4_MIN_EDGE_WEATHER", "0.08"))  # 8% for weather (GFS ensemble)
 
 # Win-rate optimization — favor bets we're likely to WIN
-V4_MIN_WIN_PROB = float(os.getenv("V4_MIN_WIN_PROB", "0.65"))          # Only bet if model says ≥65% chance of winning
-V4_MAX_BUY_PRICE = float(os.getenv("V4_MAX_BUY_PRICE", "0.50"))       # Don't pay >$0.50 per share (better risk/reward)
+V4_MIN_WIN_PROB = float(os.getenv("V4_MIN_WIN_PROB", "0.55"))          # Only bet if model says ≥55% chance of winning
+V4_MAX_BUY_PRICE = float(os.getenv("V4_MAX_BUY_PRICE", "0.65"))       # Don't pay >$0.65 per share (still 54% return)
 
 # Safety guards — prevent catastrophic losses
 V4_MAX_MODEL_MARKET_DISAGREE = float(os.getenv("V4_MAX_MODEL_MARKET_DISAGREE", "0.40"))  # Skip if model vs market >40pp
