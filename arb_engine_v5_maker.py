@@ -64,9 +64,12 @@ SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "1"))
 VPN_REQUIRED = os.getenv("PROTON_VPN_REQUIRED", "true").lower() == "true"
 
 # Maker strategy config
-MAKER_COINS = os.getenv("MAKER_COINS", "BTC,ETH").split(",")
-MAKER_BET_SIZE = float(os.getenv("MAKER_BET_SIZE", "5.0"))        # $5 per trade
-MAKER_MAX_BET = float(os.getenv("MAKER_MAX_BET", "10.0"))         # $10 max
+MAKER_COINS = os.getenv("MAKER_COINS", "BTC,ETH").split(",")  # SOL dropped — 53% win rate
+# Low-liquidity hours (UTC) — skip trading when reversals are common
+MAKER_QUIET_HOURS_START = int(os.getenv("MAKER_QUIET_HOURS_START", "0"))   # midnight UTC
+MAKER_QUIET_HOURS_END = int(os.getenv("MAKER_QUIET_HOURS_END", "7"))      # 7am UTC
+MAKER_BET_SIZE = float(os.getenv("MAKER_BET_SIZE", "3.0"))        # $3 per trade
+MAKER_MAX_BET = float(os.getenv("MAKER_MAX_BET", "5.0"))          # $5 max
 MAKER_DAILY_BANKROLL = float(os.getenv("MAKER_DAILY_BANKROLL", "50.0"))
 MAKER_DAILY_LOSS_LIMIT = float(os.getenv("MAKER_DAILY_LOSS_LIMIT", "25.0"))
 MAKER_MIN_MOVE_PCT = float(os.getenv("MAKER_MIN_MOVE_PCT", "0.10"))   # 0.1% min price move
@@ -492,6 +495,17 @@ async def run_maker_bot():
                     and window.start_price > 0
                     and bankroll.can_trade
                 ):
+                    # Skip low-liquidity hours (midnight-7am UTC)
+                    current_hour = datetime.now(timezone.utc).hour
+                    if MAKER_QUIET_HOURS_START <= current_hour < MAKER_QUIET_HOURS_END:
+                        if not window.order_placed:
+                            console.print(
+                                f"  [yellow]{coin}: Quiet hours ({MAKER_QUIET_HOURS_START}:00-"
+                                f"{MAKER_QUIET_HOURS_END}:00 UTC) — SKIP[/yellow]"
+                            )
+                            window.order_placed = True
+                        continue
+
                     # Time to make our move!
                     direction, confidence, current_price = detect_direction(
                         coin, window.start_price

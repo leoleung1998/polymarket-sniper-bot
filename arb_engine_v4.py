@@ -53,8 +53,8 @@ VPN_REQUIRED = os.getenv("PROTON_VPN_REQUIRED", "true").lower() == "true"
 # v4 Config
 V4_MIN_EDGE = float(os.getenv("V4_MIN_EDGE", "0.15"))          # 15% minimum edge (raised from 5%)
 V4_SCAN_INTERVAL = int(os.getenv("V4_SCAN_INTERVAL", "300"))    # 5 min between scans
-V4_MAX_BET = float(os.getenv("V4_MAX_BET", "10.0"))             # Higher max for daily markets
-V4_MIN_BET = float(os.getenv("V4_MIN_BET", "2.0"))              # Higher floor
+V4_MAX_BET = float(os.getenv("V4_MAX_BET", "5.0"))              # $5 max for weather
+V4_MIN_BET = float(os.getenv("V4_MIN_BET", "1.0"))              # $1 min
 V4_KELLY_FRACTION = float(os.getenv("V4_KELLY_FRACTION", "0.10"))
 V4_DAILY_BANKROLL = float(os.getenv("V4_DAILY_BANKROLL", "50.0"))
 V4_MAX_ENTRY_PRICE = float(os.getenv("V4_MAX_ENTRY_PRICE", "0.80"))
