@@ -73,6 +73,7 @@ V4_MAX_BUY_PRICE = float(os.getenv("V4_MAX_BUY_PRICE", "0.65"))       # Don't pa
 # Safety guards — prevent catastrophic losses
 V4_MAX_MODEL_MARKET_DISAGREE = float(os.getenv("V4_MAX_MODEL_MARKET_DISAGREE", "0.40"))  # Skip if model vs market >40pp
 V4_MAX_BID_OVER_MID_RATIO = float(os.getenv("V4_MAX_BID_OVER_MID_RATIO", "3.0"))        # Never bid >3x mid-price
+PAPER_TRADE = os.getenv("PAPER_TRADE", "false").lower() == "true"                        # Simulate trades without real money
 
 # Logging
 LOG_DIR = Path("data")
@@ -629,6 +630,20 @@ class OrderManager:
             actual_cost = round(ask_price * size, 2)
 
         console.print(f"[dim][v4] Posting GTC buy: {score.question[:40]} {score.best_side.upper()} | ${ask_price:.2f} x {size:.0f} shares (${actual_cost:.2f})[/dim]")
+
+        if PAPER_TRADE:
+            # Paper trade — simulate the fill
+            console.print(f"[bold yellow]📝 PAPER FILL: {score.question[:50]} {score.best_side.upper()} @ ${ask_price:.2f} | {size:.0f} shares | ${actual_cost:.2f}[/bold yellow]")
+            bankroll.place_bet(
+                amount=actual_cost,
+                score=score,
+                order_id=f"paper_{int(_time.time())}",
+                shares=size,
+                event_slug=event_slug,
+                market_type=market_type,
+            )
+            log_trade(f"📝 PAPER: {score.question[:50]} {score.best_side.upper()} @ ${ask_price:.2f} | {size:.0f} shares | ${actual_cost:.2f}")
+            return True
 
         try:
             order_args = OrderArgs(

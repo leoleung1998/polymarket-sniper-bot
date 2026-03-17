@@ -78,6 +78,7 @@ MAKER_BID_PRICE_HIGH = float(os.getenv("MAKER_BID_PRICE_HIGH", "0.95"))  # Bid r
 MAKER_ENTRY_SECONDS = int(os.getenv("MAKER_ENTRY_SECONDS", "120"))    # Enter at T-120s (2 min before close)
 MAKER_LOSS_STREAK_LIMIT = int(os.getenv("MAKER_LOSS_STREAK_LIMIT", "3"))
 MAKER_LOSS_COOLDOWN = int(os.getenv("MAKER_LOSS_COOLDOWN", "3600"))    # 1 hour
+PAPER_TRADE = os.getenv("PAPER_TRADE", "false").lower() == "true"     # Simulate trades without real money
 
 # Logging
 LOG_DIR = Path("data")
@@ -361,6 +362,8 @@ async def run_maker_bot():
     console.print(f"  Entry at:        T-{MAKER_ENTRY_SECONDS}s")
     console.print(f"  Loss streak cap: {MAKER_LOSS_STREAK_LIMIT} (then {MAKER_LOSS_COOLDOWN // 60}m cooldown)")
     console.print(f"  Order type:      GTC (maker, zero fees + rebates)")
+    if PAPER_TRADE:
+        console.print(f"  [bold yellow]📝 MODE:           PAPER TRADE (no real orders)[/bold yellow]")
     console.print()
 
     # VPN check
@@ -422,9 +425,11 @@ async def run_maker_bot():
                 prev = prev_windows.get(coin)
                 if prev and prev.needs_resolution:
                     order = prev.order_info
-                    filled = await check_if_filled(client, order["order_id"])
+                    is_paper = order.get("paper", False)
+                    filled = True if is_paper else await check_if_filled(client, order["order_id"])
                     if filled:
-                        console.print(f"  [green]✅ {coin} maker order FILLED![/green]")
+                        fill_tag = "📝 PAPER " if is_paper else ""
+                        console.print(f"  [green]✅ {fill_tag}{coin} maker order FILLED![/green]")
                         save_trade_record({
                             "type": "maker_fill", "coin": coin,
                             "direction": order["direction"], "bid_price": order["bid_price"],
@@ -438,12 +443,14 @@ async def run_maker_bot():
                             if token_price is not None and token_price >= 0.90:
                                 payout = order["size"] * 1.0
                                 bankroll.record_win(order["cost"], payout)
-                                console.print(f"  [bold green]🎯 {coin} WIN! +${payout - order['cost']:.2f}[/bold green]")
-                                tg.send_message(f"🎯 MAKER WIN\n{coin} {order['direction'].upper()}\n+${payout - order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
+                                ptag = "📝 PAPER " if is_paper else ""
+                                console.print(f"  [bold green]🎯 {ptag}{coin} WIN! +${payout - order['cost']:.2f}[/bold green]")
+                                tg.send_message(f"🎯 {ptag}MAKER WIN\n{coin} {order['direction'].upper()}\n+${payout - order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
                             elif token_price is not None and token_price <= 0.10:
                                 bankroll.record_loss(order["cost"])
-                                console.print(f"  [red]❌ {coin} LOSS: -${order['cost']:.2f}[/red]")
-                                tg.send_message(f"❌ MAKER LOSS\n{coin} {order['direction'].upper()}\n-${order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
+                                ptag = "📝 PAPER " if is_paper else ""
+                                console.print(f"  [red]❌ {ptag}{coin} LOSS: -${order['cost']:.2f}[/red]")
+                                tg.send_message(f"❌ {ptag}MAKER LOSS\n{coin} {order['direction'].upper()}\n-${order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
                             else:
                                 # Not resolved yet — give the money back for now
                                 console.print(f"  [yellow]{coin}: Resolution unclear (price: {token_price}) — refunding[/yellow]")
@@ -454,7 +461,8 @@ async def run_maker_bot():
                         bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") != order["order_id"]]
                     else:
                         # Not filled — cancel and refund
-                        await cancel_order(client, order["order_id"])
+                        if not is_paper:
+                            await cancel_order(client, order["order_id"])
                         bankroll.balance += order["cost"]
                         console.print(f"  [dim]{coin}: Order not filled — cancelled (refunded ${order['cost']:.2f})[/dim]")
                         bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") != order["order_id"]]
@@ -565,18 +573,46 @@ async def run_maker_bot():
                         window.order_placed = True
                         continue
 
-                    # Place the maker order
-                    order_info = await place_maker_order(
-                        client, market, direction, bid_price, bet_amount
-                    )
-
-                    window.order_placed = True
-                    if order_info:
-                        window.order_info = order_info
+                    if PAPER_TRADE:
+                        # Paper trade — simulate the order
+                        paper_order = {
+                            "order_id": f"paper_{coin}_{int(time.time())}",
+                            "token_id": market.up_token if direction == "up" else market.down_token,
+                            "direction": direction,
+                            "bid_price": bid_price,
+                            "size": bet_amount / bid_price,
+                            "cost": bet_amount,
+                            "coin": coin,
+                            "placed_at": time.time(),
+                            "paper": True,
+                        }
+                        console.print(
+                            f"  [bold yellow]📝 PAPER BID: {coin} {direction.upper()} "
+                            f"@ ${bid_price:.2f} | {paper_order['size']:.1f} shares | ${bet_amount:.2f}[/bold yellow]"
+                        )
+                        tg.send_message(
+                            f"📝 PAPER BID\n{coin} {direction.upper()} @ ${bid_price:.2f}\n"
+                            f"${bet_amount:.2f} ({paper_order['size']:.1f} shares)"
+                        )
+                        window.order_placed = True
+                        window.order_info = paper_order
                         if allium_tag:
                             tg.send_message(f"🧠 Smart Money{allium_tag}")
-                        bankroll.balance -= order_info["cost"]
-                        bankroll.pending_orders.append(order_info)
+                        bankroll.balance -= paper_order["cost"]
+                        bankroll.pending_orders.append(paper_order)
+                    else:
+                        # Real trade — place the maker order
+                        order_info = await place_maker_order(
+                            client, market, direction, bid_price, bet_amount
+                        )
+
+                        window.order_placed = True
+                        if order_info:
+                            window.order_info = order_info
+                            if allium_tag:
+                                tg.send_message(f"🧠 Smart Money{allium_tag}")
+                            bankroll.balance -= order_info["cost"]
+                            bankroll.pending_orders.append(order_info)
 
 
             # ── Clean up stale pending orders (older than 20 minutes) ──
