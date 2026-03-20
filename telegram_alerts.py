@@ -99,6 +99,19 @@ def alert_stuck(coin: str, side: str, amount: float, bankroll: float):
     )
 
 
+def alert_take_profit(question: str, side: str, buy_price: float, sell_price: float, shares: float, gain_pct: float):
+    """Alert when a position is sold via take profit."""
+    pnl = (sell_price - buy_price) * shares
+    _send_async(
+        f"💰 *TAKE PROFIT*\n\n"
+        f"{question[:50]}\n"
+        f"Side: {side.upper()}\n"
+        f"Buy: ${buy_price:.3f} → Sell: ${sell_price:.3f}\n"
+        f"Shares: {shares:.0f} | Gain: +{gain_pct:.0f}%\n"
+        f"P&L: +${pnl:.3f}"
+    )
+
+
 def alert_status(bankroll: float, pnl: float, wins: int, losses: int, pending: int):
     """Periodic status update."""
     pnl_emoji = "📈" if pnl >= 0 else "📉"

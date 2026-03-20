@@ -4,6 +4,7 @@ Scans for cheap prediction market outcomes and places small bets.
 Strategy: high volume, low price, asymmetric payoff.
 """
 
+import ssl_patch  # noqa: F401 — must be first, patches SSL for ProtonVPN
 import os
 import sys
 import time
@@ -12,6 +13,21 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from rich.console import Console
+
+# Always tee output to bot.log alongside the terminal
+_LOG_FILE = Path(__file__).parent / "bot.log"
+_log_fh = open(_LOG_FILE, "a", buffering=1)
+
+class _Tee:
+    def __init__(self, *streams): self.streams = streams
+    def write(self, data):
+        for s in self.streams: s.write(data)
+    def flush(self):
+        for s in self.streams: s.flush()
+    def fileno(self): return self.streams[0].fileno()
+
+sys.stdout = _Tee(sys.__stdout__, _log_fh)
+sys.stderr = _Tee(sys.__stderr__, _log_fh)
 
 from scanner import scan
 from trader import (
@@ -23,6 +39,7 @@ from trader import (
 )
 from vpn import ensure_vpn
 from tracker import show_positions, show_summary
+from take_profit import run_tp_cycle
 
 load_dotenv()
 console = Console()
@@ -30,7 +47,8 @@ console = Console()
 # --- Config from .env ---
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "")
-SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "1"))
+FUNDER = os.getenv("FUNDER", WALLET_ADDRESS)
+SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "2"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.005"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "0.03"))
 BET_SIZE_USDC = float(os.getenv("BET_SIZE_USDC", "10"))
@@ -119,7 +137,7 @@ def cmd_run():
     client = init_client(
         private_key=PRIVATE_KEY,
         signature_type=SIGNATURE_TYPE,
-        funder=WALLET_ADDRESS if WALLET_ADDRESS else None,
+        funder=FUNDER if FUNDER else None,
     )
 
     console.print("[green]Bot started. Press Ctrl+C to stop.[/green]")
@@ -135,6 +153,11 @@ def cmd_run():
                 console.print("[red]VPN disconnected. Pausing until reconnected...[/red]")
                 time.sleep(60)
                 continue
+
+            # Check take profit before scanning for new positions
+            tp_sold = run_tp_cycle(client)
+            if tp_sold:
+                console.print(f"[green]💰 Took profit on {tp_sold} position(s)[/green]")
 
             orders = run_scan_cycle(client)
             console.print(f"[green]Placed {orders} new orders[/green]")
@@ -198,21 +221,50 @@ def cmd_maker():
     maker_main()
 
 
+def cmd_tp():
+    """Run take profit monitor — sells positions when gain > TP_THRESHOLD."""
+    from take_profit import main as tp_main
+    # Pass subcommand (e.g. 'test') if provided: python bot.py tp test
+    if len(sys.argv) > 2:
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+    else:
+        sys.argv = [sys.argv[0], "run"]
+    tp_main()
+
+
 def cmd_dual():
-    """Run weather bracket + crypto maker in parallel."""
+    """Run weather bracket + crypto maker + take profit monitor in parallel."""
     import asyncio
     from arb_engine_v4 import run_bracket_bot
     from arb_engine_v5_maker import run_maker_bot
+    from take_profit import TP_SCAN_INTERVAL
 
-    async def run_both():
-        console.print("[bold green]Starting DUAL mode: Weather + Crypto Maker[/bold green]")
+    async def run_tp_loop():
+        """Async wrapper for the take profit monitor."""
+        client = init_client(
+            private_key=PRIVATE_KEY,
+            signature_type=SIGNATURE_TYPE,
+            funder=FUNDER if FUNDER else None,
+        )
+        while True:
+            try:
+                sold = run_tp_cycle(client)
+                if sold:
+                    console.print(f"[green]💰 TP: Took profit on {sold} position(s)[/green]")
+            except Exception as e:
+                console.print(f"[dim red][TP] Error: {e}[/dim red]")
+            await asyncio.sleep(TP_SCAN_INTERVAL)
+
+    async def run_all():
+        console.print("[bold green]Starting DUAL mode: Weather + Crypto Maker + Take Profit[/bold green]")
         console.print()
         await asyncio.gather(
             run_bracket_bot(),
             run_maker_bot(),
+            run_tp_loop(),
         )
 
-    asyncio.run(run_both())
+    asyncio.run(run_all())
 
 
 def cmd_positions():
@@ -233,6 +285,7 @@ def main():
         "positions": cmd_positions,
         "bracket": cmd_bracket,
         "maker": cmd_maker,
+        "tp": cmd_tp,
         "dual": cmd_dual,
     }
 
@@ -246,7 +299,8 @@ def main():
         console.print("  python bot.py run         # Start v3.5 bot (15-min crypto arb, DEPRECATED)")
         console.print("  python bot.py bracket     # Start v5 weather bot (GFS ensemble)")
         console.print("  python bot.py maker       # Start v5 crypto maker (15-min markets)")
-        console.print("  python bot.py dual        # Run weather + crypto maker in parallel")
+        console.print("  python bot.py tp          # Run take profit monitor")
+        console.print("  python bot.py dual        # Run weather + crypto maker + TP in parallel")
         console.print("  python bot.py positions   # Show positions and P&L")
 
 

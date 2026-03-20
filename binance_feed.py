@@ -5,6 +5,7 @@ No API key required — uses public market data streams.
 
 import asyncio
 import json
+import ssl
 import time
 from dataclasses import dataclass, field
 from collections import deque
@@ -119,9 +120,13 @@ async def connect_binance():
 
     print("[binance] Connecting to Binance WebSocket...")
 
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
+            async with websockets.connect(url, ping_interval=20, ssl=ssl_ctx) as ws:
                 print("[binance] Connected — streaming BTC/ETH/SOL prices")
                 feed._running = True
 

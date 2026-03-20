@@ -55,12 +55,52 @@ import telegram_alerts as tg
 from allium_feed import allium
 
 load_dotenv()
+
+
+def get_poly_balance() -> str:
+    """Fetch live Polymarket USDC balance."""
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from trader import init_client
+        client = init_client(
+            os.getenv("PRIVATE_KEY"),
+            signature_type=int(os.getenv("SIGNATURE_TYPE", "2")),
+            funder=os.getenv("FUNDER"),
+        )
+        result = client.get_balance_allowance(params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        balance = int(result.get("balance", 0)) / 1e6
+        return f"${balance:.2f}"
+    except Exception:
+        return "N/A"
+
+
+# Tee all output to bot.log AND terminal
+import sys
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+    def fileno(self):
+        return self.streams[0].fileno()
+
+_log_file = Path(__file__).parent / "bot.log"
+_log_fh = open(_log_file, "a", buffering=1)
+sys.stdout = _Tee(sys.__stdout__, _log_fh)
+sys.stderr = _Tee(sys.__stderr__, _log_fh)
+
 console = Console()
 
 # --- Config ---
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "")
-SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "1"))
+FUNDER = os.getenv("FUNDER", WALLET_ADDRESS)
+SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "2"))
 VPN_REQUIRED = os.getenv("PROTON_VPN_REQUIRED", "true").lower() == "true"
 
 # Maker strategy config
@@ -282,13 +322,16 @@ async def place_maker_order(
         )
         console.print(f"[cyan]  {msg}[/cyan]")
         log_trade(msg)
-        tg.send_message(f"📋 MAKER BID\n{market.coin} {side_label}\n${bid_price:.2f} × {size:.0f} shares\n${actual_cost:.2f} USDC")
+        tg.send_message(f"📋 MAKER BID\n{market.coin} {side_label}\n${bid_price:.2f} × {size:.0f} shares\n${actual_cost:.2f} USDC\n💰 Balance: {get_poly_balance()}")
 
         return order_info
 
     except Exception as e:
-        console.print(f"[red]  Maker order failed: {e}[/red]")
-        log_trade(f"ERROR: Maker order {market.coin} {direction}: {e}")
+        import traceback
+        status = getattr(e, 'status_code', None)
+        msg = getattr(e, 'error_msg', str(e))
+        console.print(f"[red]  Maker order failed: HTTP {status} — {msg}[/red]")
+        log_trade(f"ERROR: Maker order {market.coin} {direction}: HTTP {status} — {msg}")
         return None
 
 
@@ -374,7 +417,7 @@ async def run_maker_bot():
     console.print()
 
     # Init CLOB client
-    client = init_client(PRIVATE_KEY, SIGNATURE_TYPE, WALLET_ADDRESS)
+    client = init_client(PRIVATE_KEY, SIGNATURE_TYPE, FUNDER)
 
     # Init bankroll
     bankroll = MakerBankroll(starting=MAKER_DAILY_BANKROLL)
@@ -445,12 +488,12 @@ async def run_maker_bot():
                                 bankroll.record_win(order["cost"], payout)
                                 ptag = "📝 PAPER " if is_paper else ""
                                 console.print(f"  [bold green]🎯 {ptag}{coin} WIN! +${payout - order['cost']:.2f}[/bold green]")
-                                tg.send_message(f"🎯 {ptag}MAKER WIN\n{coin} {order['direction'].upper()}\n+${payout - order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
+                                tg.send_message(f"🎯 {ptag}MAKER WIN\n{coin} {order['direction'].upper()}\n+${payout - order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}\n💰 Balance: {get_poly_balance()}")
                             elif token_price is not None and token_price <= 0.10:
                                 bankroll.record_loss(order["cost"])
                                 ptag = "📝 PAPER " if is_paper else ""
                                 console.print(f"  [red]❌ {ptag}{coin} LOSS: -${order['cost']:.2f}[/red]")
-                                tg.send_message(f"❌ {ptag}MAKER LOSS\n{coin} {order['direction'].upper()}\n-${order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}")
+                                tg.send_message(f"❌ {ptag}MAKER LOSS\n{coin} {order['direction'].upper()}\n-${order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}\n💰 Balance: {get_poly_balance()}")
                             else:
                                 # Not resolved yet — give the money back for now
                                 console.print(f"  [yellow]{coin}: Resolution unclear (price: {token_price}) — refunding[/yellow]")

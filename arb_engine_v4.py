@@ -47,7 +47,8 @@ console = Console()
 # --- Config ---
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "")
-SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "1"))
+FUNDER = os.getenv("FUNDER", WALLET_ADDRESS)
+SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "2"))
 VPN_REQUIRED = os.getenv("PROTON_VPN_REQUIRED", "true").lower() == "true"
 
 # v4 Config
@@ -64,14 +65,14 @@ V4_MAX_OPEN_POSITIONS = int(os.getenv("V4_MAX_OPEN_POSITIONS", "6"))
 V4_MIN_HOURS_TO_RESOLUTION = float(os.getenv("V4_MIN_HOURS_TO_RESOLUTION", "2.0"))
 
 # Edge threshold — ensemble model is more reliable than single forecast
-V4_MIN_EDGE_WEATHER = float(os.getenv("V4_MIN_EDGE_WEATHER", "0.08"))  # 8% for weather (GFS ensemble)
+V4_MIN_EDGE_WEATHER = float(os.getenv("V4_MIN_EDGE_WEATHER", "0.10"))  # 10% for weather (raised from 8% for better selectivity)
 
 # Win-rate optimization — favor bets we're likely to WIN
-V4_MIN_WIN_PROB = float(os.getenv("V4_MIN_WIN_PROB", "0.55"))          # Only bet if model says ≥55% chance of winning
-V4_MAX_BUY_PRICE = float(os.getenv("V4_MAX_BUY_PRICE", "0.65"))       # Don't pay >$0.65 per share (still 54% return)
+V4_MIN_WIN_PROB = float(os.getenv("V4_MIN_WIN_PROB", "0.60"))          # Only bet if model says ≥60% chance of winning (raised from 55%)
+V4_MAX_BUY_PRICE = float(os.getenv("V4_MAX_BUY_PRICE", "0.75"))       # Don't pay >$0.75 per share (raised from $0.65 to capture more opportunities)
 
-# Safety guards — prevent catastrophic losses
-V4_MAX_MODEL_MARKET_DISAGREE = float(os.getenv("V4_MAX_MODEL_MARKET_DISAGREE", "0.40"))  # Skip if model vs market >40pp
+# Safety guards — prevent catastrophic losses (relaxed to capture high-confidence weather trades)
+V4_MAX_MODEL_MARKET_DISAGREE = float(os.getenv("V4_MAX_MODEL_MARKET_DISAGREE", "0.60"))  # Skip if model vs market >60pp (raised from 40%)
 V4_MAX_BID_OVER_MID_RATIO = float(os.getenv("V4_MAX_BID_OVER_MID_RATIO", "3.0"))        # Never bid >3x mid-price
 PAPER_TRADE = os.getenv("PAPER_TRADE", "false").lower() == "true"                        # Simulate trades without real money
 
@@ -832,7 +833,7 @@ async def run_bracket_bot():
     console.print()
 
     # Init CLOB client
-    client = init_client(PRIVATE_KEY, SIGNATURE_TYPE, WALLET_ADDRESS)
+    client = init_client(PRIVATE_KEY, SIGNATURE_TYPE, FUNDER)
 
     # Test Allium smart money connection
     allium_ok = allium.test_connection()
@@ -955,18 +956,19 @@ async def run_bracket_bot():
                     continue
 
                 # ── Model-vs-market sanity check ──
-                # If model and market disagree by >40pp, the market probably knows something.
-                # This prevents betting against already-known outcomes.
+                # Only skip when market price is HIGHER than model — means we'd be overpaying.
+                # If model is higher than market, that's the edge we're looking for — allow it.
                 market_prob = s.poly_yes_price if s.best_side == "yes" else s.poly_no_price
-                disagreement = abs(win_prob - market_prob)
-                if disagreement > V4_MAX_MODEL_MARKET_DISAGREE:
+                if market_prob > win_prob and (market_prob - win_prob) > V4_MAX_MODEL_MARKET_DISAGREE:
                     skipped_disagree += 1
+                    city = s.question.split("in ")[-1].split(" on")[0] if "in " in s.question else s.question[:20]
+                    console.print(f"  [dim]  ↳ SKIP {city}: market overpriced model={win_prob:.0%} market={market_prob:.0%} gap={market_prob - win_prob:.0%}[/dim]")
                     continue
 
                 tradeable.append((s, e))
 
             if skipped_disagree:
-                console.print(f"  [dim]⚠️ Skipped {skipped_disagree} bets (model vs market disagree >{V4_MAX_MODEL_MARKET_DISAGREE:.0%})[/dim]")
+                console.print(f"  [dim]⚠️ Skipped {skipped_disagree} bets (market overpriced vs model >{V4_MAX_MODEL_MARKET_DISAGREE:.0%})[/dim]")
 
             # Sort by expected value (edge × win_prob), not just edge
             # This favors high-probability bets that compound
@@ -1095,7 +1097,7 @@ async def run_bracket_bot():
 
                 scan_msg = (
                     f"📡 *Scan #{scan_count}*\n"
-                    f"Markets scanned: {len(all_events)} weather\n"
+                    f"Markets scanned: {len(weather_events)} weather\n"
                     f"Opportunities: {len(tradeable)} found"
                 )
                 if opp_lines:

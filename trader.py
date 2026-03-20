@@ -35,7 +35,7 @@ class PlacedOrder:
     status: str
 
 
-def init_client(private_key: str, signature_type: int = 1, funder: str = None) -> ClobClient:
+def init_client(private_key: str, signature_type: int = 2, funder: str = None) -> ClobClient:
     """Initialize and authenticate the CLOB client."""
     kwargs = {
         "host": HOST,

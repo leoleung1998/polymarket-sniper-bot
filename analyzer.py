@@ -17,6 +17,7 @@ from pathlib import Path
 # --- Paths ---
 DATA_DIR = Path("data")
 TRADES_FILE = DATA_DIR / "trades.json"
+TP_LOG_FILE = DATA_DIR / "tp_log.json"
 ANALYSIS_FILE = DATA_DIR / "analysis.json"
 LEARNING_FILE = DATA_DIR / "learning_state.json"
 RECOMMENDATIONS_FILE = DATA_DIR / "recommendations.json"
@@ -75,14 +76,34 @@ class TradeAnalysis:
 
 
 def load_trades() -> list[dict]:
-    """Load all trades from JSON file."""
-    if not TRADES_FILE.exists():
-        return []
-    try:
-        data = json.loads(TRADES_FILE.read_text())
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, FileNotFoundError):
-        return []
+    """Load all trades from JSON file, including TP sells from tp_log.json."""
+    trades = []
+    if TRADES_FILE.exists():
+        try:
+            data = json.loads(TRADES_FILE.read_text())
+            trades = data if isinstance(data, list) else []
+        except (json.JSONDecodeError, FileNotFoundError):
+            pass
+
+    # Merge TP sells as resolved "win" outcomes so they count in analysis
+    if TP_LOG_FILE.exists():
+        try:
+            tp_sells = json.loads(TP_LOG_FILE.read_text())
+            for sell in tp_sells:
+                if sell.get("type") == "sell" and sell.get("source") != "test":
+                    trades.append({
+                        "type": "win",
+                        "coin": sell.get("side", "TP"),
+                        "side": sell.get("side", ""),
+                        "amount": sell.get("buy_price", 0) * sell.get("shares", 0),
+                        "payout": sell.get("sell_price", 0) * sell.get("shares", 0),
+                        "timestamp": sell.get("timestamp", ""),
+                        "source": "take_profit",
+                    })
+        except (json.JSONDecodeError, FileNotFoundError):
+            pass
+
+    return trades
 
 
 def load_learning_state() -> dict:

@@ -236,7 +236,7 @@ CRYPTO_SLUG_PATTERNS = {
 }
 
 
-def _fetch_all_active_events(max_pages: int = 3) -> list[dict]:
+def _fetch_all_active_events(max_pages: int = 10) -> list[dict]:
     """Bulk-fetch all active events from Gamma API (paginated).
 
     The Gamma API's slug_contains/tag filters are unreliable, so we fetch

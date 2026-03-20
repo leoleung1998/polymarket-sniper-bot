@@ -11,11 +11,12 @@ Automated trading bot for Polymarket prediction markets. Three strategies, one c
 | **+ Cloud Deployment** | Bot runs 24/7 even when your laptop is closed | +20 minutes |
 | **+ AI Control Bot** | Message your bot from your phone, Claude AI diagnoses issues and makes fixes | +5 minutes |
 
-## The Three Strategies
+## The Four Strategies
 
 1. **Weather Bracket Bot** — Trades daily weather temperature brackets using the GFS 31-member ensemble forecast. Counts how many ensemble members land in each bracket to compute probability. Buys when edge > 8%.
 2. **Crypto Maker Bot** — Trades 15-min BTC/ETH/SOL up/down markets. Posts GTC limit orders at $0.88-0.95 on the likely winning side 8 minutes before window close, filtered by Allium on-chain smart money signals. Zero taker fees + maker rebates. Running at **88% win rate**.
 3. **Sniper** — Buys outcomes priced under 3 cents. High volume, low cost, lottery-ticket math.
+4. **Sniper + Take Profit** — Same as Sniper, but automatically sells positions when gain exceeds TP_THRESHOLD (default +40%). Monitors open positions every 60 seconds and places aggressive GTC sell orders N basis points below the real best ask.
 
 ---
 
@@ -52,6 +53,7 @@ Polymarket blocks US IPs. Connect [ProtonVPN](https://pr.tn/ref/WMF7NFH4) (or an
 python bot.py bracket     # Weather bot (recommended to start)
 python bot.py maker       # Crypto maker (15-min BTC/ETH/SOL)
 python bot.py dual        # Both in parallel
+python bot.py tp          # Sniper + Take Profit (buy cheap, sell at +40%)
 
 # Utilities:
 python bot.py scan        # Preview cheap outcomes without buying
@@ -173,6 +175,14 @@ Scans all active Polymarket events for outcomes priced under 3 cents. Places sma
 
 **The math:** Buy 100 outcomes at $0.02 each = $200 total. If 1 wins = $500 payout.
 
+### Sniper + Take Profit (`python bot.py tp`)
+
+Enriches the Sniper with an automatic exit strategy. Scans for cheap outcomes as normal, but also monitors all open positions every 60 seconds. When a position gains more than `TP_THRESHOLD` (default 40%), it automatically sells.
+
+**How selling works:** Fetches the live CLOB orderbook, skips AMM floor/ceiling orders ($0.01/$0.99), finds the real best ask from actual market makers, then places a GTC sell order `TP_AGGRESSION_BPS` below the ask. If the price crosses the best bid, it fills immediately as a taker. Otherwise it sits at the front of the sell queue.
+
+**Works across all strategies** — monitors `data/orders.json` (Sniper), `data/v4_trades.json` (Weather), and logs sells to `data/tp_log.json`.
+
 ---
 
 ## Configuration Reference
@@ -219,7 +229,7 @@ All settings are in `.env`. Defaults work out of the box — only `PRIVATE_KEY` 
 | `MAKER_LOSS_STREAK_LIMIT` | `3` | Pause after 3 consecutive losses |
 | `MAKER_LOSS_COOLDOWN` | `3600` | Cooldown after loss streak (seconds) |
 
-### Sniper Bot
+### Sniper Bot / Take Profit Bot
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -228,6 +238,9 @@ All settings are in `.env`. Defaults work out of the box — only `PRIVATE_KEY` 
 | `BET_SIZE_USDC` | `10` | USDC per bet |
 | `MAX_DAILY_SPEND` | `100` | Daily spending cap |
 | `SCAN_INTERVAL_MINUTES` | `30` | Minutes between scans |
+| `TP_THRESHOLD` | `0.40` | Sell when gain exceeds this (40%) |
+| `TP_SCAN_INTERVAL` | `60` | Check positions every N seconds |
+| `TP_AGGRESSION_BPS` | `10` | Basis points below best ask when selling (crosses book = instant fill) |
 
 ### Optional Services
 
@@ -245,8 +258,10 @@ All settings are in `.env`. Defaults work out of the box — only `PRIVATE_KEY` 
 | `python bot.py bracket` | Weather bracket bot (GFS ensemble) |
 | `python bot.py maker` | Crypto maker bot (15-min BTC/ETH/SOL) |
 | `python bot.py dual` | Run weather + crypto maker in parallel |
+| `python bot.py tp` | Sniper + Take Profit (buy cheap, sell at +40%) |
+| `python bot.py tp test` | Test full buy→sell cycle with $5 |
 | `python bot.py scan` | Preview cheap outcomes (no buying) |
-| `python bot.py run` | Legacy v1 sniper bot |
+| `python bot.py run` | Legacy v1 sniper bot (no TP) |
 | `python bot.py positions` | Show positions and P&L |
 | `python telegram_control.py` | AI-powered Telegram control bot (Level 4) |
 
@@ -273,6 +288,9 @@ polymarket-sniper-bot/
 ├── telegram_control.py     # Claude AI Telegram bot (control from phone)
 ├── telegram_alerts.py      # Trade alerts via Telegram (Level 2)
 │
+├── # ── Take Profit Engine ──
+├── take_profit.py          # TP monitor: checks positions, sells at +40% gain
+│
 ├── # ── Shared Infrastructure ──
 ├── trader.py               # CLOB order placement + tracking
 ├── tracker.py              # Position monitoring + P&L
@@ -281,6 +299,9 @@ polymarket-sniper-bot/
 ├── allium_feed.py          # On-chain smart money signals
 │
 └── data/                   # Auto-created: orders, trades, logs
+    ├── orders.json         # Sniper positions
+    ├── v4_trades.json      # Weather bot positions
+    └── tp_log.json         # Take profit sell history
 ```
 
 ## Safety Features

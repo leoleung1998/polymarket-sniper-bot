@@ -21,10 +21,12 @@ Or just send natural language:
 Claude has access to read files, edit code, check logs, and restart the bot.
 """
 
+import ssl_patch  # noqa: F401 — must be first, patches SSL for ProtonVPN
 import os
 import json
 import subprocess
 import time
+import ssl
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -36,6 +38,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 
 BOT_DIR = Path(__file__).parent.resolve()
 POLL_INTERVAL = 2  # seconds between Telegram update checks
@@ -51,7 +54,10 @@ def tg_request(method: str, data: dict = None) -> dict:
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     else:
         req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -88,131 +94,145 @@ def send_typing(chat_id: str):
 
 # ── Tool implementations (what Claude can do) ──
 
-def tool_read_logs(lines: int = 30, service: str = "polymarket-bot") -> str:
-    """Read recent bot logs from journalctl."""
-    try:
+# Script names for each "service" locally
+LOCAL_SCRIPTS = {
+    "polymarket-bot": "bot.py",
+    "crypto-maker": "arb_engine_v5_maker.py",
+}
+LOG_FILE = BOT_DIR / "bot.log"
+
+
+def _find_pid(script_name: str) -> str | None:
+    """Return PID of a running python script, or None.
+    Checks the script name itself AND bot.py (which runs all engines in dual mode)."""
+    for name in [script_name, "bot.py"]:
         result = subprocess.run(
-            ["sudo", "journalctl", "-u", service, "--no-pager", "-n", str(lines)],
-            capture_output=True, text=True, timeout=10
+            ["pgrep", "-f", name],
+            capture_output=True, text=True,
         )
-        raw = result.stdout or result.stderr or "No logs found"
-        # Clean up systemd prefix noise for readability
-        cleaned = []
-        for line in raw.strip().split("\n"):
-            # Remove the "Mar 16 00:32:24 ip-172-31-39-190 python[4934]: " prefix
-            if "python[" in line:
-                parts = line.split("]: ", 1)
-                cleaned.append(parts[1] if len(parts) > 1 else line)
-            elif "systemd[" in line:
-                if "Started" in line or "Stopped" in line:
-                    cleaned.append(line.split("]: ", 1)[-1])
-            else:
-                cleaned.append(line)
-        return "\n".join(cleaned)
+        pids = result.stdout.strip().splitlines()
+        if pids:
+            return pids[0]
+    return None
+
+
+def tool_read_logs(lines: int = 30, service: str = "polymarket-bot") -> str:
+    """Read recent bot logs from local log file and data directory."""
+    try:
+        output = []
+        if LOG_FILE.exists():
+            all_lines = LOG_FILE.read_text().splitlines()
+            output.append("\n".join(all_lines[-lines:]) or "Log file is empty")
+
+        data_dir = BOT_DIR / "data"
+        if data_dir.exists():
+            log_files = sorted(data_dir.glob("*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
+            for lf in log_files[:3]:
+                all_lines = lf.read_text().splitlines()
+                if all_lines:
+                    output.append(f"\n--- {lf.name} ---\n" + "\n".join(all_lines[-lines:]))
+
+        if output:
+            return "\n".join(output)
+        return f"No log files found in {BOT_DIR} or {BOT_DIR / 'data'}"
     except Exception as e:
         return f"Error reading logs: {e}"
 
 
 def tool_bot_status() -> str:
-    """Get bot service status in human-readable format."""
+    """Get bot status by checking running processes."""
     lines = []
-
-    # Check both services
     for service, label in [("polymarket-bot", "Weather Bot"), ("crypto-maker", "Crypto Maker")]:
-        try:
-            result = subprocess.run(
-                ["sudo", "systemctl", "is-active", service],
-                capture_output=True, text=True, timeout=5
+        script = LOCAL_SCRIPTS[service]
+        pid = _find_pid(script)
+        if pid:
+            # Get memory usage via ps
+            mem_result = subprocess.run(
+                ["ps", "-o", "rss=", "-p", pid],
+                capture_output=True, text=True,
             )
-            is_active = result.stdout.strip() == "active"
+            try:
+                mem_mb = int(mem_result.stdout.strip()) / 1024
+                mem_str = f"{mem_mb:.0f}MB"
+            except (ValueError, TypeError):
+                mem_str = "?"
+            lines.append(f"🟢 {label}: Running (PID {pid}, {mem_str} RAM)")
+        else:
+            lines.append(f"🔴 {label}: Not running")
 
-            if is_active:
-                # Get uptime
-                uptime_result = subprocess.run(
-                    ["sudo", "systemctl", "show", service, "--property=ActiveEnterTimestamp"],
-                    capture_output=True, text=True, timeout=5
-                )
-                timestamp = uptime_result.stdout.strip().split("=", 1)[-1] if uptime_result.stdout else "unknown"
+    # Show last bankroll line from log if available
+    if LOG_FILE.exists():
+        log_lines = LOG_FILE.read_text().splitlines()
+        for log_line in reversed(log_lines):
+            if "Bankroll:" in log_line and "P&L:" in log_line:
+                lines.append(f"\n📊 {log_line.strip()}")
+                break
 
-                # Get memory
-                mem_result = subprocess.run(
-                    ["sudo", "systemctl", "show", service, "--property=MemoryCurrent"],
-                    capture_output=True, text=True, timeout=5
-                )
-                mem_bytes = mem_result.stdout.strip().split("=", 1)[-1] if mem_result.stdout else "0"
-                try:
-                    mem_mb = int(mem_bytes) / (1024 * 1024)
-                    mem_str = f"{mem_mb:.0f}MB"
-                except (ValueError, TypeError):
-                    mem_str = "?"
-
-                lines.append(f"🟢 {label}: Running ({mem_str} RAM)")
-                lines.append(f"   Started: {timestamp}")
-            else:
-                lines.append(f"🔴 {label}: Stopped")
-        except Exception:
-            lines.append(f"⚪ {label}: Unknown")
-
-    # Separate scoreboards for each bot
-    for service, header in [("polymarket-bot", "🌤️ WEATHER SCOREBOARD"), ("crypto-maker", "📈 CRYPTO SCOREBOARD")]:
-        try:
-            log_result = subprocess.run(
-                ["sudo", "journalctl", "-u", service, "--no-pager", "-n", "20"],
-                capture_output=True, text=True, timeout=5
-            )
-            log_lines = log_result.stdout.strip().split("\n")
-            bankroll_info = None
-            for log_line in reversed(log_lines):
-                if "Bankroll:" in log_line and "P&L:" in log_line:
-                    bankroll_info = log_line.split("Bankroll:", 1)[-1].strip()
-                    break
-
-            lines.append(f"\n{header}")
-            if bankroll_info:
-                for part in bankroll_info.split("|"):
-                    part = part.strip()
-                    if part.startswith("$") or part.startswith("-$"):
-                        lines.append(f"  💰 Bankroll: {part}")
-                    elif "P&L" in part:
-                        lines.append(f"  📊 {part}")
-                    elif "W/L" in part:
-                        lines.append(f"  🎯 {part}")
-                    elif "Pending" in part:
-                        lines.append(f"  ⏳ {part}")
-                    else:
-                        lines.append(f"  💰 Bankroll: {part}")
-            else:
-                lines.append("  No data yet")
-        except Exception:
-            lines.append(f"\n{header}")
-            lines.append("  Could not read logs")
+    # Fetch live Polymarket wallet balance
+    try:
+        import ssl_patch
+        from trader import init_client
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        client = init_client(
+            PRIVATE_KEY,
+            signature_type=int(os.getenv("SIGNATURE_TYPE", "2")),
+            funder=os.getenv("FUNDER"),
+        )
+        result = client.get_balance_allowance(params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        balance = int(result.get("balance", 0)) / 1e6
+        lines.append(f"💰 Polymarket balance: ${balance:.2f} USDC")
+    except Exception as e:
+        lines.append(f"💰 Balance: unavailable ({e})")
 
     return "\n".join(lines) if lines else "Could not get status"
 
 
 def tool_restart_bot() -> str:
-    """Restart the trading bot service."""
+    """Restart the trading bot by killing and relaunching it."""
     try:
-        subprocess.run(["sudo", "systemctl", "restart", "polymarket-bot"], timeout=10)
+        script = LOCAL_SCRIPTS["polymarket-bot"]
+        pid = _find_pid(script)
+        if pid:
+            subprocess.run(["kill", pid], timeout=5)
+            time.sleep(2)
+        subprocess.Popen(
+            ["python", str(BOT_DIR / script)],
+            cwd=str(BOT_DIR),
+            stdout=open(LOG_FILE, "a"),
+            stderr=subprocess.STDOUT,
+        )
         time.sleep(2)
-        return "✅ Weather bot restarted!\n\n" + tool_bot_status()
+        return "✅ Bot restarted!\n\n" + tool_bot_status()
     except Exception as e:
         return f"Error restarting: {e}"
 
 
 def tool_pause_bot() -> str:
-    """Stop the trading bot service."""
+    """Stop the trading bot process."""
     try:
-        subprocess.run(["sudo", "systemctl", "stop", "polymarket-bot"], timeout=10)
-        return "⏸️ Weather bot paused. Send /resume to start again."
+        script = LOCAL_SCRIPTS["polymarket-bot"]
+        pid = _find_pid(script)
+        if pid:
+            subprocess.run(["kill", pid], timeout=5)
+            return "⏸️ Bot paused. Send /resume to start again."
+        return "Bot is not running."
     except Exception as e:
         return f"Error stopping: {e}"
 
 
 def tool_resume_bot() -> str:
-    """Start the trading bot service."""
+    """Start the trading bot process."""
     try:
-        subprocess.run(["sudo", "systemctl", "start", "polymarket-bot"], timeout=10)
+        script = LOCAL_SCRIPTS["polymarket-bot"]
+        pid = _find_pid(script)
+        if pid:
+            return f"Bot is already running (PID {pid})."
+        subprocess.Popen(
+            ["python", str(BOT_DIR / script)],
+            cwd=str(BOT_DIR),
+            stdout=open(LOG_FILE, "a"),
+            stderr=subprocess.STDOUT,
+        )
         time.sleep(2)
         return tool_bot_status()
     except Exception as e:
@@ -279,6 +299,40 @@ def tool_run_command(command: str) -> str:
         return "Command timed out (30s limit)"
     except Exception as e:
         return f"Error: {e}"
+
+
+def tool_tp_status() -> str:
+    """Show open positions vs TP threshold and recent TP sells."""
+    try:
+        from take_profit import load_open_positions, get_current_price, TP_THRESHOLD, TP_LOG_FILE
+        import json
+        lines = [f"💰 *Take Profit Monitor* (threshold: +{TP_THRESHOLD*100:.0f}%)\n"]
+
+        positions = load_open_positions()
+        if not positions:
+            lines.append("No open positions tracked.")
+        else:
+            lines.append(f"*Open positions: {len(positions)}*")
+            for pos in positions[:10]:
+                current = get_current_price(pos["token_id"])
+                buy = pos["buy_price"]
+                gain = (current - buy) / buy if current and buy > 0 else 0
+                bar = "🟢" if gain >= TP_THRESHOLD else "🟡" if gain > 0 else "🔴"
+                q = pos.get("question", pos["token_id"])[:40]
+                lines.append(f"{bar} {q}: buy=${buy:.3f} now=${current:.3f} ({gain*100:+.0f}%)" if current else f"⚪ {q}: buy=${buy:.3f} (no price)")
+
+        # Recent TP sells
+        if TP_LOG_FILE.exists():
+            sells = json.loads(TP_LOG_FILE.read_text())
+            sells = [s for s in sells if s.get("type") == "sell" and s.get("source") != "test"]
+            if sells:
+                lines.append(f"\n*Recent TP sells: {len(sells)}*")
+                for s in sells[-5:]:
+                    lines.append(f"✅ {s.get('question','?')[:35]}: +{s.get('gain_pct',0):.0f}% | P&L ${s.get('pnl',0):+.3f}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error fetching TP status: {e}"
 
 
 def tool_list_files(directory: str = ".") -> str:
@@ -384,6 +438,11 @@ TOOLS = [
         "description": "Restart the bot after making code changes to apply them.",
         "input_schema": {"type": "object", "properties": {}}
     },
+    {
+        "name": "tp_status",
+        "description": "Show open positions vs take profit threshold and recent TP sells.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -397,39 +456,45 @@ TOOL_HANDLERS = {
     "run_command": lambda args: tool_run_command(args["command"]),
     "list_files": lambda args: tool_list_files(args.get("directory", ".")),
     "deploy_restart": lambda args: tool_deploy_restart(),
+    "tp_status": lambda args: tool_tp_status(),
 }
 
-SYSTEM_PROMPT = """You are the remote control AI for a Polymarket trading bot running on an AWS EC2 server.
+SYSTEM_PROMPT = """You are the remote control AI for a Polymarket trading bot running locally on a Mac (not a Linux server).
 
 The bot trades weather temperature brackets on Polymarket using a GFS 31-member ensemble forecast model.
-It's written in Python and runs as a systemd service called 'polymarket-bot'.
+It's written in Python and runs locally on a Mac (not as a systemd service).
+Use bot_status, read_logs, restart_bot, pause_bot, resume_bot tools normally — they work via local process management.
 
 Key files:
-- arb_engine_v4.py — Main trading engine (weather scoring, order execution, bankroll management)
+- arb_engine_v4.py — Weather bracket engine (GFS ensemble scoring, order execution)
+- arb_engine_v5_maker.py — Crypto maker engine (15-min BTC/ETH/SOL windows)
+- take_profit.py — Take profit monitor (sells positions when gain > TP_THRESHOLD)
 - bracket_model.py — Probability models (ensemble counting, normal distribution fallback)
 - bracket_markets.py — Market discovery from Polymarket Gamma API
 - noaa_feed.py — Weather data (GFS ensemble from Open-Meteo + NOAA forecasts)
-- bot.py — CLI entry point
-- telegram_alerts.py — Trade notification alerts
+- bot.py — CLI entry point (run/scan/bracket/maker/dual)
 - .env — Configuration (DO NOT share secrets)
+- data/tp_log.json — Take profit sell history
+- data/v4_trades.json — Weather bot trade history
 
 You can:
 1. Read logs to diagnose issues
-2. Check bot status
+2. Check bot status (use tp_status for take profit positions)
 3. Read and edit source code files
 4. Restart the bot after changes
 5. Run shell commands for debugging
 
 Keep responses concise — this is Telegram, not a full IDE. Use short paragraphs.
 When making code changes, always explain what you're changing and why, then restart the bot.
-Never share API keys, private keys, or other secrets."""
+Never share API keys, private keys, or other secrets.
+If a question is outside the scope of the trading bot (e.g. general weather, news, unrelated topics), say so immediately without using any tools."""
 
 
 def call_claude(user_message: str, chat_id: str) -> str:
     """Call Claude API with tool use, handle tool calls in a loop."""
     messages = [{"role": "user", "content": user_message}]
 
-    for iteration in range(8):  # Max 8 tool-use rounds
+    for iteration in range(12):  # Max 12 tool-use rounds
         # Call Claude API
         request_body = {
             "model": "claude-sonnet-4-20250514",
@@ -451,7 +516,10 @@ def call_claude(user_message: str, chat_id: str) -> str:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=60, context=ssl_ctx) as resp:
                 response = json.loads(resp.read().decode())
         except Exception as e:
             return f"Claude API error: {e}"
@@ -519,12 +587,15 @@ def handle_quick_command(command: str) -> str | None:
         return tool_pause_bot()
     elif cmd == "/resume":
         return tool_resume_bot()
+    elif cmd == "/tp":
+        return tool_tp_status()
     elif cmd == "/help":
         return (
             "*Polymarket Bot Remote Control*\n\n"
             "*Quick commands:*\n"
             "`/status` — Bot status & uptime\n"
             "`/logs` — Recent log lines\n"
+            "`/tp` — Take profit positions & sells\n"
             "`/restart` — Restart the bot\n"
             "`/pause` — Stop trading\n"
             "`/resume` — Resume trading\n"
@@ -573,7 +644,10 @@ def main():
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?" + urllib.parse.urlencode(params)
             req = urllib.request.Request(url)
 
-            with urllib.request.urlopen(req, timeout=35) as resp:
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=35, context=ssl_ctx) as resp:
                 updates = json.loads(resp.read().decode())
 
             if not updates.get("ok"):

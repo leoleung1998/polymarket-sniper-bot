@@ -10,6 +10,7 @@ Both provide next-day high temperature forecasts with ~2°F / ~1°C accuracy.
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -56,31 +57,36 @@ class CityForecast:
 # lat, lon, country (US = use NOAA, else = Open-Meteo)
 
 CITY_COORDS = {
-    # (lat, lon, country, utc_offset_hours)
-    # US cities (NOAA) — offsets are standard time (DST adds 1)
-    "Dallas": (32.7767, -96.7970, "US", -6),
-    "Atlanta": (33.7490, -84.3880, "US", -5),
-    "NYC": (40.7128, -74.0060, "US", -5),
-    "New York City": (40.7128, -74.0060, "US", -5),
-    "Chicago": (41.8781, -87.6298, "US", -6),
-    "Miami": (25.7617, -80.1918, "US", -5),
-    "Seattle": (47.6062, -122.3321, "US", -8),
+    # (lat, lon, country, iana_timezone)
+    # US cities (NOAA)
+    "Dallas":        (32.7767,  -96.7970, "US",  "America/Chicago"),
+    "Atlanta":       (33.7490,  -84.3880, "US",  "America/New_York"),
+    "NYC":           (40.7128,  -74.0060, "US",  "America/New_York"),
+    "New York City": (40.7128,  -74.0060, "US",  "America/New_York"),
+    "Chicago":       (41.8781,  -87.6298, "US",  "America/Chicago"),
+    "Miami":         (25.7617,  -80.1918, "US",  "America/New_York"),
+    "Seattle":       (47.6062, -122.3321, "US",  "America/Los_Angeles"),
 
     # International cities (Open-Meteo)
-    "Paris": (48.8566, 2.3522, "INT", 1),
-    "London": (51.5074, -0.1278, "INT", 0),
-    "Tokyo": (35.6762, 139.6503, "INT", 9),
-    "Seoul": (37.5665, 126.9780, "INT", 9),
-    "Toronto": (43.6532, -79.3832, "INT", -5),
-    "Buenos Aires": (-34.6037, -58.3816, "INT", -3),
-    "Sao Paulo": (-23.5505, -46.6333, "INT", -3),
-    "Tel Aviv": (32.0853, 34.7818, "INT", 2),
-    "Ankara": (39.9334, 32.8597, "INT", 3),
-    "Munich": (48.1351, 11.5820, "INT", 1),
-    "Wellington": (-41.2865, 174.7762, "INT", 12),
-    "Shanghai": (31.2304, 121.4737, "INT", 8),
-    "Lucknow": (26.8467, 80.9462, "INT", 5),
-    "Singapore": (1.3521, 103.8198, "INT", 8),
+    "Paris":         (48.8566,   2.3522,  "INT", "Europe/Paris"),
+    "London":        (51.5074,  -0.1278,  "INT", "Europe/London"),
+    "Tokyo":         (35.6762, 139.6503,  "INT", "Asia/Tokyo"),
+    "Seoul":         (37.5665, 126.9780,  "INT", "Asia/Seoul"),
+    "Toronto":       (43.6532,  -79.3832, "INT", "America/Toronto"),
+    "Buenos Aires":  (-34.6037, -58.3816, "INT", "America/Argentina/Buenos_Aires"),
+    "Sao Paulo":     (-23.5505, -46.6333, "INT", "America/Sao_Paulo"),
+    "Tel Aviv":      (32.0853,   34.7818, "INT", "Asia/Jerusalem"),
+    "Ankara":        (39.9334,   32.8597, "INT", "Europe/Istanbul"),
+    "Munich":        (48.1351,   11.5820, "INT", "Europe/Berlin"),
+    "Wellington":    (-41.2865, 174.7762, "INT", "Pacific/Auckland"),
+    "Shanghai":      (31.2304,  121.4737, "INT", "Asia/Shanghai"),
+    "Lucknow":       (26.8467,   80.9462, "INT", "Asia/Kolkata"),
+    "Singapore":     (1.3521,   103.8198, "INT", "Asia/Singapore"),
+    "Hong Kong":     (22.3193,  114.1694, "INT", "Asia/Hong_Kong"),
+    "Milan":         (45.4654,    9.1859, "INT", "Europe/Rome"),
+    "Warsaw":        (52.2297,   21.0122, "INT", "Europe/Warsaw"),
+    "Madrid":        (40.4168,   -3.7038, "INT", "Europe/Madrid"),
+    "Taipei":        (25.0330,  121.5654, "INT", "Asia/Taipei"),
 }
 
 # Forecast cache: key = "city|date" → CityForecast
@@ -110,22 +116,9 @@ def get_city_local_hour(city: str) -> float | None:
     coords = _get_city_coords(city)
     if not coords:
         return None
-    utc_offset = coords[3]
-    # Rough DST: add 1 hour March-October for non-tropical cities
-    now = datetime.now(timezone.utc)
-    month = now.month
-    lat = coords[0]
-    if 3 <= month <= 10 and abs(lat) > 23.5:
-        # Northern hemisphere spring/summer DST (or southern autumn/winter — skip DST)
-        if lat > 0:
-            utc_offset += 1
-    elif month <= 2 or month >= 11:
-        # Southern hemisphere summer DST
-        if lat < -23.5 and city not in ("Buenos Aires", "Sao Paulo"):  # Argentina doesn't use DST
-            utc_offset += 1
-
-    local_hour = (now.hour + now.minute / 60 + utc_offset) % 24
-    return local_hour
+    tz_name = coords[3]
+    local_now = datetime.now(ZoneInfo(tz_name))
+    return local_now.hour + local_now.minute / 60
 
 
 def is_observation_complete(city: str, resolution_date: str) -> bool:
@@ -139,8 +132,7 @@ def is_observation_complete(city: str, resolution_date: str) -> bool:
     if not coords:
         return False  # Unknown city — don't block
 
-    utc_offset = coords[3]
-    now = datetime.now(timezone.utc)
+    tz_name = coords[3]
 
     # Parse resolution date
     try:
@@ -149,7 +141,7 @@ def is_observation_complete(city: str, resolution_date: str) -> bool:
         return False
 
     # Check if resolution date is today in the city's timezone
-    local_now = now + timedelta(hours=utc_offset)
+    local_now = datetime.now(ZoneInfo(tz_name))
     local_date = local_now.date()
 
     if local_date > res_date:
@@ -498,7 +490,7 @@ def get_ensemble_forecast(city: str, target_date: str) -> list[float] | None:
                 "longitude": lon,
                 "models": "gfs_seamless",
                 "daily": "temperature_2m_max",
-                "forecast_days": 3,
+                "forecast_days": 7,
                 "timezone": "auto",
             },
             timeout=15,
