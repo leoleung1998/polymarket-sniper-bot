@@ -139,13 +139,13 @@ def save_order(order: PlacedOrder):
 
 
 def get_daily_spend() -> float:
-    """Calculate how much USDC has been spent today."""
+    """Calculate how much USDC has been spent today (excludes unfilled orders)."""
     history = load_order_history()
     today = datetime.utcnow().strftime("%Y-%m-%d")
     return sum(
         o["usdc_spent"]
         for o in history
-        if o["timestamp"].startswith(today)
+        if o["timestamp"].startswith(today) and o.get("status") != "unfilled"
     )
 
 

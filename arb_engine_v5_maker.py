@@ -49,10 +49,12 @@ from crypto_markets import (
     discover_market, CryptoMarket, WINDOW_SECONDS,
     get_current_window_timestamp, get_next_window_timestamp,
 )
+from poly_feed import poly_feed, poll_poly_prices
 from trader import init_client, PlacedOrder, save_order
 from vpn import ensure_vpn
 import telegram_alerts as tg
 from allium_feed import allium
+from redeemer import check_and_redeem
 
 load_dotenv()
 
@@ -124,6 +126,20 @@ PAPER_TRADE = os.getenv("PAPER_TRADE", "false").lower() == "true"     # Simulate
 LOG_DIR = Path("data")
 LOG_FILE = LOG_DIR / "maker_trades.log"
 TRADES_FILE = LOG_DIR / "maker_trades.json"
+PENDING_FILE = LOG_DIR / "maker_pending.json"  # live pending orders for kill switch
+STATE_FILE  = LOG_DIR / "maker_state.json"     # persistent W/L + band stats across restarts
+
+
+def save_pending_orders(orders: list):
+    """Persist pending maker orders to disk so kill switch can find them."""
+    LOG_DIR.mkdir(exist_ok=True)
+    PENDING_FILE.write_text(json.dumps(orders, indent=2))
+
+
+def clear_pending_orders():
+    """Clear pending orders file when all resolved."""
+    if PENDING_FILE.exists():
+        PENDING_FILE.write_text("[]")
 
 
 def log_trade(message: str):
@@ -147,6 +163,16 @@ def save_trade_record(trade: dict):
 
 # --- Maker Bankroll ---
 
+def get_confidence_band(confidence_pct: float) -> str:
+    """Bucket a confidence % into a named band for win-rate tracking."""
+    if confidence_pct < 0.20:
+        return "small"    # 0.10–0.19%
+    elif confidence_pct < 0.40:
+        return "medium"   # 0.20–0.39%
+    else:
+        return "large"    # 0.40%+
+
+
 @dataclass
 class MakerBankroll:
     starting: float
@@ -157,11 +183,17 @@ class MakerBankroll:
     daily_losses: float = 0.0
     paused_until: float = 0.0
     pending_orders: list = None  # list of dicts
+    band_wins: dict = None        # wins per confidence band
+    band_losses: dict = None      # losses per confidence band
 
     def __post_init__(self):
         self.balance = self.starting
         if self.pending_orders is None:
             self.pending_orders = []
+        if self.band_wins is None:
+            self.band_wins = {"small": 0, "medium": 0, "large": 0}
+        if self.band_losses is None:
+            self.band_losses = {"small": 0, "medium": 0, "large": 0}
 
     @property
     def pnl(self) -> float:
@@ -185,16 +217,27 @@ class MakerBankroll:
             return False
         return True
 
-    def record_win(self, bet_amount: float, payout: float):
+    def band_win_rate(self, band: str) -> float | None:
+        """Observed win rate for a band. Returns None if < 10 trades (not enough data)."""
+        w = self.band_wins.get(band, 0)
+        l = self.band_losses.get(band, 0)
+        return w / (w + l) if (w + l) >= 10 else None
+
+    def record_win(self, bet_amount: float, payout: float, band: str = ""):
         self.wins += 1
         self.balance += payout
         self.loss_streak = 0
-        log_trade(f"WIN: +${payout - bet_amount:.2f} | Bankroll: ${self.balance:.2f}")
+        if band:
+            self.band_wins[band] = self.band_wins.get(band, 0) + 1
+        log_trade(f"WIN: +${payout - bet_amount:.2f} | Bankroll: ${self.balance:.2f}" + (f" | band={band}" if band else ""))
+        self.save_state()
 
-    def record_loss(self, bet_amount: float):
+    def record_loss(self, bet_amount: float, band: str = ""):
         self.losses += 1
         self.loss_streak += 1
         self.daily_losses += bet_amount
+        if band:
+            self.band_losses[band] = self.band_losses.get(band, 0) + 1
         if self.loss_streak >= MAKER_LOSS_STREAK_LIMIT:
             self.paused_until = time.time() + MAKER_LOSS_COOLDOWN
             console.print(f"[red]🚨 {self.loss_streak} consecutive losses — pausing {MAKER_LOSS_COOLDOWN // 60} min[/red]")
@@ -203,7 +246,82 @@ class MakerBankroll:
                 f"Pausing {MAKER_LOSS_COOLDOWN // 60} min\n"
                 f"Bankroll: ${self.balance:.2f}"
             )
-        log_trade(f"LOSS: -${bet_amount:.2f} | Bankroll: ${self.balance:.2f} | Streak: {self.loss_streak}")
+        log_trade(f"LOSS: -${bet_amount:.2f} | Bankroll: ${self.balance:.2f} | Streak: {self.loss_streak}" + (f" | band={band}" if band else ""))
+        self.save_state()
+
+    def save_state(self):
+        """Persist cumulative W/L and band stats to disk."""
+        try:
+            LOG_DIR.mkdir(exist_ok=True)
+            state = {
+                "wins": self.wins,
+                "losses": self.losses,
+                "band_wins": self.band_wins,
+                "band_losses": self.band_losses,
+                "balance": self.balance,
+                "daily_losses": self.daily_losses,
+                "daily_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            }
+            STATE_FILE.write_text(json.dumps(state, indent=2))
+        except Exception:
+            pass  # never block trading on a save failure
+
+    @classmethod
+    def load_state(cls, starting: float) -> "MakerBankroll":
+        """Create a MakerBankroll, restoring cumulative stats from disk if available."""
+        b = cls(starting=starting)
+        try:
+            if not STATE_FILE.exists():
+                return b
+
+            state = json.loads(STATE_FILE.read_text())
+
+            # Discard state older than 7 days — band data gets stale
+            saved_date = state.get("daily_date", "")
+            if saved_date:
+                from datetime import date
+                try:
+                    age = (date.today() - date.fromisoformat(saved_date)).days
+                    if age > 7:
+                        console.print(f"[yellow]State file is {age} days old — starting fresh[/yellow]")
+                        STATE_FILE.unlink(missing_ok=True)
+                        return b
+                except ValueError:
+                    pass
+
+            b.wins        = int(state.get("wins", 0))
+            b.losses      = int(state.get("losses", 0))
+            b.band_wins   = state.get("band_wins", b.band_wins)
+            b.band_losses = state.get("band_losses", b.band_losses)
+
+            # Sanity-check restored balance: must be within 10x of starting bankroll
+            restored_balance = float(state.get("balance", starting))
+            if 0 < restored_balance < starting * 10:
+                b.balance = restored_balance
+            else:
+                console.print(f"[yellow]Restored balance ${restored_balance:.2f} looks wrong — resetting to ${starting:.2f}[/yellow]")
+
+            # Only restore daily_losses if saved today (reset at midnight)
+            if saved_date == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+                b.daily_losses = float(state.get("daily_losses", 0.0))
+
+            console.print(f"[dim]Restored session: W/L {b.wins}/{b.losses} ({b.win_rate:.0%}) | ${b.balance:.2f} | Bands: {b.band_stats()}[/dim]")
+
+        except Exception as e:
+            console.print(f"[yellow]State load failed ({e}) — starting fresh[/yellow]")
+        return b
+
+    def band_stats(self) -> str:
+        """Per-band win rate summary for logging."""
+        parts = []
+        for band in ("small", "medium", "large"):
+            w = self.band_wins.get(band, 0)
+            l = self.band_losses.get(band, 0)
+            if w + l > 0:
+                wr = w / (w + l)
+                flag = "*" if (w + l) < 10 else ""  # * = not enough data to trust
+                parts.append(f"{band}: {w}/{w+l} ({wr:.0%}{flag})")
+        return " | ".join(parts) if parts else "no data"
 
     def status_line(self) -> str:
         pnl = self.pnl
@@ -212,11 +330,34 @@ class MakerBankroll:
             f"Bankroll: ${self.balance:.2f} | "
             f"P&L: [{color}]${pnl:+.2f}[/{color}] | "
             f"W/L: {self.wins}/{self.losses} ({self.win_rate:.0%}) | "
-            f"Pending: {len(self.pending_orders)}"
+            f"Pending: {len(self.pending_orders)}\n"
+            f"  Bands: {self.band_stats()}"
         )
 
 
 # --- Direction Detection ---
+
+def _get_kline_open(coin: str) -> float | None:
+    """Fetch the open price of the current 15m Binance candle via REST.
+    Used on window init so we always compare against the true window start,
+    even when the bot joins mid-window."""
+    import requests as _req
+    symbol_map = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
+    symbol = symbol_map.get(coin)
+    if not symbol:
+        return None
+    try:
+        resp = _req.get(
+            "https://data-api.binance.vision/api/v3/klines",
+            params={"symbol": symbol, "interval": "15m", "limit": 1},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        kline = resp.json()[0]
+        return float(kline[1])  # index 1 = open price
+    except Exception:
+        return None
+
 
 def detect_direction(coin: str, window_start_price: float) -> tuple[str | None, float, float]:
     """
@@ -240,20 +381,39 @@ def detect_direction(coin: str, window_start_price: float) -> tuple[str | None, 
     return direction, abs(pct_move), current
 
 
-def calculate_bid_price(confidence_pct: float) -> float:
+def calculate_bid_price(confidence_pct: float, bankroll: "MakerBankroll" = None) -> tuple[float, str]:
     """
-    Calculate maker bid price based on confidence.
+    Calculate maker bid price based on confidence and observed band win rate.
 
-    Higher price move = more confident = willing to pay more.
-    0.1% move → bid $0.88 (risky)
-    0.3% move → bid $0.92 (moderate)
-    0.5%+ move → bid $0.95 (high confidence)
+    Returns (bid_price, band).
+
+    Config ceiling is the absolute max — but if observed win rate for this band
+    is below break-even for that price, the bid is capped at (win_rate − 5% margin).
+
+    Break-even: bid price = win rate (e.g. bid $0.88 needs 88% win rate)
+    With 90% win rate → bid must stay ≤ $0.85 to keep real edge.
     """
-    # Linear interpolation: 0.1% → low, 0.5% → high
+    band = get_confidence_band(confidence_pct)
+
+    # Linear interpolation from config range
     t = min(1.0, max(0.0, (confidence_pct - MAKER_MIN_MOVE_PCT) / 0.4))
     bid = MAKER_BID_PRICE_LOW + t * (MAKER_BID_PRICE_HIGH - MAKER_BID_PRICE_LOW)
-    # Round to 2 decimal places (Polymarket precision)
-    return round(bid, 2)
+
+    # Auto-cap: if we have ≥10 trades in this band, enforce risk/reward discipline
+    if bankroll is not None:
+        observed_wr = bankroll.band_win_rate(band)
+        if observed_wr is not None:
+            # Must bid below win rate to have positive EV
+            # Safety margin: 5% (bid at win_rate − 0.05)
+            ev_safe_bid = round(observed_wr - 0.05, 2)
+            if bid > ev_safe_bid:
+                console.print(
+                    f"  [yellow]Bid capped: ${bid:.2f} → ${ev_safe_bid:.2f} "
+                    f"(band '{band}': {observed_wr:.0%} win rate − 5% margin)[/yellow]"
+                )
+                bid = ev_safe_bid
+
+    return round(bid, 2), band
 
 
 # --- Order Execution ---
@@ -349,6 +509,39 @@ async def cancel_order(client, order_id: str) -> bool:
             return False
 
 
+def _chase_price(token_id: str, max_price: float) -> float:
+    """
+    Return an aggressive entry price, always capped at max_price.
+
+    Logic:
+      - best_bid + 1 tick (0.0001) if that stays <= max_price  → front of book
+      - max_price if best_bid + 1 tick would exceed our ceiling → still enter, just at ceiling
+      - max_price if orderbook fetch fails or no real bids       → safe fallback
+
+    Never skips — always returns a valid price <= max_price.
+    """
+    try:
+        resp = requests.get(
+            "https://clob.polymarket.com/book",
+            params={"token_id": token_id},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        book = resp.json()
+        bids = sorted(book.get("bids", []), key=lambda x: float(x["price"]), reverse=True)
+        real_bids = [b for b in bids if float(b["price"]) > 0.05]
+        if real_bids:
+            best_bid = float(real_bids[0]["price"])
+            aggressive = round(best_bid + 0.0001, 4)  # 1 tick above best bid
+            if aggressive <= max_price:
+                return aggressive          # front of book, within ceiling
+            else:
+                return max_price           # best_bid already at/above ceiling → place at ceiling
+    except Exception:
+        pass
+    return max_price                       # fetch failed → fall back to original bid price
+
+
 async def check_if_filled(client, order_id: str) -> bool:
     """Check if an order has been filled (no longer on the book)."""
     try:
@@ -361,6 +554,10 @@ async def check_if_filled(client, order_id: str) -> bool:
 
 # --- Window Tracking ---
 
+CHASE_INTERVAL  = 30   # seconds between cancel-replace cycles
+CHASE_STOP_SECS = 60   # stop chasing this many seconds before window close
+
+
 @dataclass
 class WindowState:
     """Track the state of a 15-min trading window for a coin."""
@@ -371,6 +568,9 @@ class WindowState:
     order_placed: bool = False
     order_info: dict = None
     filled: bool = False
+    chasing: bool = False          # actively cancel-replacing to stay at best bid
+    last_chase_ts: float = 0.0     # last time we ran a chase cycle
+    chase_max_price: float = 0.0   # our bid_price ceiling — never exceed this
 
     @property
     def seconds_remaining(self) -> int:
@@ -420,7 +620,7 @@ async def run_maker_bot():
     client = init_client(PRIVATE_KEY, SIGNATURE_TYPE, FUNDER)
 
     # Init bankroll
-    bankroll = MakerBankroll(starting=MAKER_DAILY_BANKROLL)
+    bankroll = MakerBankroll.load_state(starting=MAKER_DAILY_BANKROLL)
 
     # Fetch initial Binance prices
     console.print("[binance] Fetching initial prices...")
@@ -440,8 +640,14 @@ async def run_maker_bot():
     # Start Binance WebSocket in background
     ws_task = asyncio.create_task(connect_binance())
 
+    # Start Polymarket price poller in background (one bulk call every 5s)
+    poly_task = asyncio.create_task(poll_poly_prices(MAKER_COINS))
+    console.print("[dim]Polymarket price feed started (polling every 5s)[/dim]")
+
     # Wait a moment for WebSocket to connect
     await asyncio.sleep(3)
+
+    last_status_print = 0.0
 
     # Track windows per coin
     windows: dict[str, WindowState] = {}
@@ -452,8 +658,6 @@ async def run_maker_bot():
 
     try:
         while True:
-            now = int(time.time())
-
             for coin in MAKER_COINS:
                 if coin not in SYMBOLS:
                     continue
@@ -485,12 +689,12 @@ async def run_maker_bot():
                             token_price = get_current_price(order["token_id"])
                             if token_price is not None and token_price >= 0.90:
                                 payout = order["size"] * 1.0
-                                bankroll.record_win(order["cost"], payout)
+                                bankroll.record_win(order["cost"], payout, band=order.get("conf_band", ""))
                                 ptag = "📝 PAPER " if is_paper else ""
                                 console.print(f"  [bold green]🎯 {ptag}{coin} WIN! +${payout - order['cost']:.2f}[/bold green]")
                                 tg.send_message(f"🎯 {ptag}MAKER WIN\n{coin} {order['direction'].upper()}\n+${payout - order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}\n💰 Balance: {get_poly_balance()}")
                             elif token_price is not None and token_price <= 0.10:
-                                bankroll.record_loss(order["cost"])
+                                bankroll.record_loss(order["cost"], band=order.get("conf_band", ""))
                                 ptag = "📝 PAPER " if is_paper else ""
                                 console.print(f"  [red]❌ {ptag}{coin} LOSS: -${order['cost']:.2f}[/red]")
                                 tg.send_message(f"❌ {ptag}MAKER LOSS\n{coin} {order['direction'].upper()}\n-${order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}\n💰 Balance: {get_poly_balance()}")
@@ -502,6 +706,7 @@ async def run_maker_bot():
                             console.print(f"  [yellow]{coin}: Resolution check failed ({e}) — refunding[/yellow]")
                             bankroll.balance += order["cost"]
                         bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") != order["order_id"]]
+                        save_pending_orders(bankroll.pending_orders)
                     else:
                         # Not filled — cancel and refund
                         if not is_paper:
@@ -509,6 +714,7 @@ async def run_maker_bot():
                         bankroll.balance += order["cost"]
                         console.print(f"  [dim]{coin}: Order not filled — cancelled (refunded ${order['cost']:.2f})[/dim]")
                         bankroll.pending_orders = [o for o in bankroll.pending_orders if o.get("order_id") != order["order_id"]]
+                        save_pending_orders(bankroll.pending_orders)
                     prev.order_info = None  # Mark resolved
                     del prev_windows[coin]
 
@@ -517,8 +723,9 @@ async def run_maker_bot():
                     if window and window.order_info:
                         prev_windows[coin] = window
 
-                    # New window — record start price
-                    start_price = feed.get_price(coin) or 0
+                    # New window — use 15m kline OPEN as true window start price.
+                    # Fetching from Binance REST ensures accuracy even when joining mid-window.
+                    start_price = _get_kline_open(coin) or feed.get_price(coin) or 0
                     if start_price > 0:
                         feed.set_window_start(coin, start_price)
 
@@ -547,15 +754,15 @@ async def run_maker_bot():
                     and bankroll.can_trade
                 ):
                     # Skip low-liquidity hours (midnight-7am UTC)
-                    current_hour = datetime.now(timezone.utc).hour
-                    if MAKER_QUIET_HOURS_START <= current_hour < MAKER_QUIET_HOURS_END:
-                        if not window.order_placed:
-                            console.print(
-                                f"  [yellow]{coin}: Quiet hours ({MAKER_QUIET_HOURS_START}:00-"
-                                f"{MAKER_QUIET_HOURS_END}:00 UTC) — SKIP[/yellow]"
-                            )
-                            window.order_placed = True
-                        continue
+                    # current_hour = datetime.now(timezone.utc).hour
+                    # if MAKER_QUIET_HOURS_START <= current_hour < MAKER_QUIET_HOURS_END:
+                    #     if not window.order_placed:
+                    #         console.print(
+                    #             f"  [yellow]{coin}: Quiet hours ({MAKER_QUIET_HOURS_START}:00-"
+                    #             f"{MAKER_QUIET_HOURS_END}:00 UTC) — SKIP[/yellow]"
+                    #         )
+                    #         window.order_placed = True
+                    #     continue
 
                     # Time to make our move!
                     direction, confidence, current_price = detect_direction(
@@ -573,6 +780,27 @@ async def run_maker_bot():
                         f"  [green]{coin}: {direction.upper()} detected ({confidence:.3f}% move) "
                         f"| ${window.start_price:,.2f} → ${current_price:,.2f}[/green]"
                     )
+
+                    # Check Polymarket current odds vs Binance signal
+                    poly_up, poly_down = poly_feed.get_market_prices(coin)
+                    poly_price = poly_up if direction == "up" else poly_down
+                    if poly_price is not None:
+                        # Binance-derived win probability (simple: >50% if we're confident)
+                        binance_prob = min(0.98, 0.5 + confidence / 2)
+                        gap = binance_prob - poly_price
+                        gap_color = "green" if gap > 0.05 else "yellow" if gap > 0 else "red"
+                        console.print(
+                            f"  [{gap_color}]Poly {direction.upper()}: ${poly_price:.2f} | "
+                            f"Binance signal: {binance_prob:.0%} | Gap: {gap:+.0%}[/{gap_color}]"
+                        )
+                        if gap < 0:
+                            console.print(
+                                f"  [yellow]{coin}: Polymarket already priced in ({poly_price:.2f} > {binance_prob:.0%}) — SKIP[/yellow]"
+                            )
+                            window.order_placed = True
+                            continue
+                    else:
+                        console.print(f"  [dim]{coin} Poly price: not yet available[/dim]")
 
                     # Check Allium smart money confirmation
                     allium_signal = allium.get_signal(coin, current_window_start)
@@ -598,8 +826,8 @@ async def run_maker_bot():
                     else:
                         console.print(f"  [dim]{coin} Allium: No data (trading on Binance alone)[/dim]")
 
-                    # Calculate bid price based on confidence
-                    bid_price = calculate_bid_price(confidence)
+                    # Calculate bid price based on confidence + observed band win rate
+                    bid_price, conf_band = calculate_bid_price(confidence, bankroll)
 
                     # Scale bet size with confidence
                     if confidence >= 0.3:
@@ -626,6 +854,7 @@ async def run_maker_bot():
                             "size": bet_amount / bid_price,
                             "cost": bet_amount,
                             "coin": coin,
+                            "conf_band": conf_band,
                             "placed_at": time.time(),
                             "paper": True,
                         }
@@ -644,19 +873,97 @@ async def run_maker_bot():
                         bankroll.balance -= paper_order["cost"]
                         bankroll.pending_orders.append(paper_order)
                     else:
-                        # Real trade — place the maker order
+                        # Collect any USDC redeemed in background + trigger new redemptions
+                        funder = os.getenv("FUNDER", "")
+                        private_key = os.getenv("PRIVATE_KEY", "")
+                        if funder and private_key:
+                            redeemed = check_and_redeem(funder, private_key)
+                            if redeemed > 0:
+                                bankroll.balance += redeemed
+
+                        # Real trade — place aggressive limit, then chase the book
+                        token_id = market.up_token_id if direction == "up" else market.down_token_id
+                        entry_price = _chase_price(token_id, bid_price)
                         order_info = await place_maker_order(
-                            client, market, direction, bid_price, bet_amount
+                            client, market, direction, entry_price, bet_amount
                         )
 
                         window.order_placed = True
                         if order_info:
+                            order_info["conf_band"] = conf_band
                             window.order_info = order_info
+                            window.chasing = True
+                            window.last_chase_ts = time.time()
+                            window.chase_max_price = bid_price
                             if allium_tag:
                                 tg.send_message(f"🧠 Smart Money{allium_tag}")
                             bankroll.balance -= order_info["cost"]
                             bankroll.pending_orders.append(order_info)
+                            save_pending_orders(bankroll.pending_orders)
 
+
+            # ── Chase unfilled orders: cancel + replace at best_bid+1tick ──
+            for coin in list(windows.keys()):
+                window = windows.get(coin)
+                if not window or not window.chasing or not window.order_info:
+                    continue
+
+                secs_left = window.seconds_remaining
+
+                # Stop chasing when window is close to closing
+                if secs_left <= CHASE_STOP_SECS:
+                    window.chasing = False
+                    console.print(f"  [dim]{coin}: Chase stopped — {secs_left}s left, leaving order[/dim]")
+                    continue
+
+                # Throttle: only chase every CHASE_INTERVAL seconds
+                if time.time() - window.last_chase_ts < CHASE_INTERVAL:
+                    continue
+                window.last_chase_ts = time.time()
+
+                order = window.order_info
+                if order.get("paper"):
+                    window.chasing = False
+                    continue
+
+                # Check if already filled
+                filled = await check_if_filled(client, order["order_id"])
+                if filled:
+                    window.chasing = False
+                    console.print(f"  [green]{coin}: Order filled at ${order['bid_price']:.4f}[/green]")
+                    continue
+
+                # Not filled — cancel and replace at new best_bid+1tick
+                await cancel_order(client, order["order_id"])
+                token_id = order["token_id"]
+                new_price = _chase_price(token_id, window.chase_max_price)
+                if new_price is None:
+                    continue
+
+                new_order = await place_maker_order(
+                    client,
+                    discover_market(coin),
+                    order["direction"],
+                    new_price,
+                    order["cost"],  # same dollar amount
+                )
+                if new_order:
+                    new_order["conf_band"] = order.get("conf_band", "")
+                    # Swap out old order for new one in pending list
+                    bankroll.pending_orders = [
+                        o for o in bankroll.pending_orders
+                        if o.get("order_id") != order["order_id"]
+                    ]
+                    bankroll.pending_orders.append(new_order)
+                    window.order_info = new_order
+                    save_pending_orders(bankroll.pending_orders)
+                    console.print(
+                        f"  [cyan]{coin}: Chased → ${new_price:.4f} "
+                        f"(was ${order['bid_price']:.4f}, max ${window.chase_max_price:.2f}, "
+                        f"{secs_left}s left)[/cyan]"
+                    )
+                else:
+                    window.chasing = False  # place failed — stop chasing
 
             # ── Clean up stale pending orders (older than 20 minutes) ──
             stale_cutoff = time.time() - 1200  # 20 minutes ago
@@ -679,9 +986,17 @@ async def run_maker_bot():
                     if o not in stale_orders
                 ]
 
-            # Print status periodically
-            if now % 60 == 0:
+            # Print status every 60s (time-based, not modulo — never misses)
+            if time.time() - last_status_print >= 60:
+                last_status_print = time.time()
                 console.print(f"  {bankroll.status_line()}")
+                poly_lines = []
+                for c in MAKER_COINS:
+                    up, down = poly_feed.get_market_prices(c)
+                    if up and down:
+                        poly_lines.append(f"{c} ↑${up:.2f} ↓${down:.2f}")
+                if poly_lines:
+                    console.print(f"  [dim]Poly odds: {' | '.join(poly_lines)} ({poly_feed.stats})[/dim]")
 
             # Fast poll — check every second near window boundaries
             await asyncio.sleep(1)

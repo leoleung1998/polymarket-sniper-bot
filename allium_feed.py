@@ -574,8 +574,33 @@ class AlliumFeed:
     #  MCP TRANSPORT LAYER
     # ═══════════════════════════════════════════════
 
+    def _mcp_structured(self, tool_name: str, arguments: dict) -> dict:
+        """Call an Allium MCP tool and return raw structuredContent dict."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": int(time.time() * 1000) % 1000000,
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+        }
+        resp = requests.post(ALLIUM_MCP_URL, json=payload, headers=self._headers(), timeout=30)
+        if resp.status_code != 200:
+            raise Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        for line in resp.text.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = json.loads(line[5:].strip())
+            if data.get("result", {}).get("isError"):
+                content = data["result"].get("content", [])
+                raise Exception(content[0].get("text", "Unknown error") if content else "Unknown error")
+            return data.get("result", {}).get("structuredContent", {})
+        return {}
+
     def _run_sql(self, sql: str, cache_ttl: float = FLOW_CACHE_TTL) -> list[dict]:
-        """Execute SQL query against Allium via MCP endpoint."""
+        """Execute SQL via Allium's async queue-then-poll pattern.
+
+        API: explorer_queue_sql → run_id → poll explorer_get_sql_results until done.
+        """
         cache_key = hash(sql)
         if cache_key in self._query_cache:
             ts, result = self._query_cache[cache_key]
@@ -583,33 +608,27 @@ class AlliumFeed:
                 return result
 
         try:
-            if not self._initialized:
-                self._init_mcp()
+            # Step 1: queue the query → get run_id
+            queued = self._mcp_structured("explorer_queue_sql", {"sql": sql})
+            run_id = queued.get("run_id")
+            if not run_id:
+                raise Exception(f"No run_id in response: {queued}")
 
-            payload = {
-                "jsonrpc": "2.0",
-                "id": int(time.time() * 1000) % 1000000,
-                "method": "tools/call",
-                "params": {
-                    "name": "explorer_run_sql",
-                    "arguments": {"sql": sql}
-                }
-            }
+            # Step 2: poll until complete (max 30s)
+            for _ in range(15):
+                time.sleep(2)
+                res = self._mcp_structured("explorer_get_sql_results", {"run_id": run_id})
+                status = res.get("status", "")
+                if status in ("error", "failed"):
+                    raise Exception(f"Query failed: {res}")
+                if status in ("complete", "success", "finished"):
+                    rows = res.get("data") or res.get("rows") or []
+                    result = rows if isinstance(rows, list) else []
+                    self._query_cache[cache_key] = (time.time(), result)
+                    return result
+                # status = "running" or "queued" — keep polling
 
-            resp = requests.post(
-                ALLIUM_MCP_URL,
-                json=payload,
-                headers=self._headers(),
-                timeout=45,
-            )
-
-            if resp.status_code != 200:
-                raise Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
-
-            result = self._parse_response(resp.text)
-
-            self._query_cache[cache_key] = (time.time(), result)
-            return result
+            raise Exception(f"Query timed out (run_id={run_id})")
 
         except Exception as e:
             self._available = False

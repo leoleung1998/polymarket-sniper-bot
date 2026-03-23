@@ -14,7 +14,7 @@ Automated trading bot for Polymarket prediction markets. Three strategies, one c
 ## The Four Strategies
 
 1. **Weather Bracket Bot** — Trades daily weather temperature brackets using the GFS 31-member ensemble forecast. Counts how many ensemble members land in each bracket to compute probability. Buys when edge > 8%.
-2. **Crypto Maker Bot** — Trades 15-min BTC/ETH/SOL up/down markets. Posts GTC limit orders at $0.88-0.95 on the likely winning side 8 minutes before window close, filtered by Allium on-chain smart money signals. Zero taker fees + maker rebates. Running at **88% win rate**.
+2. **Crypto Maker Bot** — Trades 15-min BTC/ETH/SOL up/down markets. Enters aggressively at best bid + 1 tick (capped at our price ceiling), chases fills every 30s by cancel-replacing, filtered by Allium on-chain smart money signals. Auto-redeems winning CTF tokens in background before each bet cycle. Running at **88% win rate**.
 3. **Sniper** — Buys outcomes priced under 3 cents. High volume, low cost, lottery-ticket math.
 4. **Sniper + Take Profit** — Same as Sniper, but automatically sells positions when gain exceeds TP_THRESHOLD (default +40%). Monitors open positions every 60 seconds and places aggressive GTC sell orders N basis points below the real best ask.
 
@@ -158,16 +158,41 @@ Trades 15-minute BTC/ETH/SOL "Up or Down" markets using a maker (limit order) st
 
 **Why taker arbitrage is dead:** In Feb 2026, Polymarket introduced [dynamic taker fees up to 3.15%](https://www.financemagnates.com/cryptocurrency/polymarket-introduces-dynamic-fees-to-curb-latency-arbitrage-in-short-term-crypto-markets/) and removed the 500ms taker delay. The old strategy of FOK-ing the spread no longer works.
 
-**The new strategy:**
+**The strategy:**
 1. Connects to Binance WebSocket for real-time BTC/ETH/SOL prices
-2. Tracks price from the start of each 15-min window
-3. At T-480 seconds (8 min) before window close: checks if price has moved >0.1% in one direction
-4. Queries **Allium on-chain data** for smart money confirmation — if wallets with 70%+ win rates disagree with the direction, the trade is blocked
-5. If direction is clear AND smart money agrees → posts GTC maker bid at $0.88-0.95 on the likely winning side
-6. If ambiguous (< 0.1% move) or smart money contradicts → skips
-7. 8 minutes on the orderbook gives plenty of time for fills. After window close: collect $1.00/share on wins.
+2. Uses the **15-min Binance kline open price** as the true window start (accurate even when joining mid-window)
+3. At T-480s (8 min) before close: checks if price moved >0.1% in one direction
+4. Queries **Allium on-chain data** for smart money confirmation — if wallets with 70%+ win rates disagree, the trade is blocked
+5. If clear AND smart money agrees → places aggressive limit at **best bid + 1 tick**, capped at our price ceiling
+6. **Chases fills every 30s**: cancel + replace at new best bid + 1 tick until filled or T-60s before close
+7. Stops chasing 60s before close — leaves final order on the book to stand
+8. After window close: collect $1.00/share on wins
 
-**Why this works:** Entering 8 minutes early gives orders time to fill, while the Allium smart money filter catches bad direction calls. We only trade when Binance price direction AND on-chain whale flow agree. Running at **88% win rate (7W/1L)** since adding the Allium filter. Maker orders = zero fees + maker rebates.
+**Bid price ceiling logic:**
+- Scales from `MAKER_BID_PRICE_LOW` (small moves) to `MAKER_BID_PRICE_HIGH` (large moves)
+- **Per-band auto-cap**: tracks win rates in three confidence bands (small/medium/large). Once a band has 10+ trades, caps bid at `observed_win_rate - 5%` to stay profitable
+- Chase price is always `min(best_bid + 0.0001, ceiling)` — falls back to ceiling if orderbook unavailable
+
+**Order chasing (cancel-replace):**
+- Entry: `best_bid + 1 tick` if below ceiling, otherwise `ceiling`
+- Every 30s: check if filled → if not, cancel + re-place at new best bid + 1 tick
+- Stops at T-60s before close (last order left to stand)
+- Ceiling is never violated — protects edge regardless of orderbook movement
+
+**Auto-redemption:**
+- Winning positions (resolved YES/NO) become CTF tokens locked in the Gnosis Safe proxy wallet
+- Before each bet, the bot calls `check_and_redeem()` which fires a **background thread** — no trading delay
+- Background thread waits 120s for oracle settlement, then calls `safe.execTransaction(CTF.redeemPositions(...))` on-chain using ~0.04 POL per redemption
+- Falls back to Polymarket gasless relay if EOA has no POL
+- Errors are caught + sent to Telegram — redemption failure never blocks trading
+
+**Persistent session state:**
+- W/L counts, balance, and per-band win rates are saved to `data/maker_state.json` after every trade
+- Restored on restart (band data is the most critical — it drives the bid price auto-cap)
+- State older than 7 days is discarded (band data goes stale)
+- Daily loss counter resets at midnight UTC
+
+**Why it works:** 8-minute entry + aggressive chasing means high fill rates while Allium smart money filter blocks bad calls. Break-even bid prices (0.82/0.88) give realistic margins vs win rate. Running at **88% win rate** since adding the Allium filter. Maker orders = zero fees + maker rebates.
 
 ### Sniper Mode (`python bot.py scan` / `run`)
 
@@ -195,7 +220,8 @@ All settings are in `.env`. Defaults work out of the box — only `PRIVATE_KEY` 
 |----------|---------|-------------|
 | `PRIVATE_KEY` | required | Polymarket wallet private key |
 | `WALLET_ADDRESS` | required | Your Polygon wallet address |
-| `SIGNATURE_TYPE` | `1` | `1` = email login, `0` = EOA wallet |
+| `SIGNATURE_TYPE` | `1` | `0` = EOA wallet, `1` = email/Magic login, `2` = MetaMask/Gnosis Safe |
+| `FUNDER` | — | Proxy wallet address (required for `SIGNATURE_TYPE=2`) |
 | `PROTON_VPN_REQUIRED` | `true` | Require non-US IP before trading |
 
 ### Weather Bot
@@ -218,13 +244,13 @@ All settings are in `.env`. Defaults work out of the box — only `PRIVATE_KEY` 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAKER_COINS` | `BTC,ETH,SOL` | Coins to trade (comma-separated) |
-| `MAKER_BET_SIZE` | `5.0` | Default bet per trade (USDC) |
-| `MAKER_MAX_BET` | `10.0` | Max bet per trade (USDC) |
-| `MAKER_DAILY_BANKROLL` | `50.0` | Daily budget (USDC) |
-| `MAKER_DAILY_LOSS_LIMIT` | `25.0` | Stop trading after $25 in losses |
+| `MAKER_BET_SIZE` | `30` | Default bet per trade (USDC) |
+| `MAKER_MAX_BET` | `40.0` | Max bet per trade (USDC) |
+| `MAKER_DAILY_BANKROLL` | `100.0` | Daily budget (USDC) |
+| `MAKER_DAILY_LOSS_LIMIT` | `80.0` | Stop trading after this much in losses |
 | `MAKER_MIN_MOVE_PCT` | `0.10` | Min price move to bet (0.1%) |
-| `MAKER_BID_PRICE_LOW` | `0.88` | Bid price for low-confidence trades |
-| `MAKER_BID_PRICE_HIGH` | `0.95` | Bid price for high-confidence trades |
+| `MAKER_BID_PRICE_LOW` | `0.82` | Bid ceiling for small moves — break-even at 82% win rate |
+| `MAKER_BID_PRICE_HIGH` | `0.88` | Bid ceiling for large moves — break-even at 88% win rate |
 | `MAKER_ENTRY_SECONDS` | `480` | Enter at T-480s (8 min) before close |
 | `MAKER_LOSS_STREAK_LIMIT` | `3` | Pause after 3 consecutive losses |
 | `MAKER_LOSS_COOLDOWN` | `3600` | Cooldown after loss streak (seconds) |
@@ -280,9 +306,11 @@ polymarket-sniper-bot/
 ├── noaa_feed.py            # Weather data (GFS ensemble + NOAA + Open-Meteo)
 │
 ├── # ── Crypto Maker Bot ──
-├── arb_engine_v5_maker.py  # 15-min crypto maker strategy
+├── arb_engine_v5_maker.py  # 15-min crypto maker strategy (chase + auto-redeem)
 ├── crypto_markets.py       # 15-min up/down market discovery
 ├── binance_feed.py         # Real-time BTC/ETH/SOL prices (WebSocket)
+├── poly_feed.py            # Polymarket odds feed (polls every 5s)
+├── redeemer.py             # Auto-redeems winning CTF tokens via Safe.execTransaction
 │
 ├── # ── Remote Control (Level 4) ──
 ├── telegram_control.py     # Claude AI Telegram bot (control from phone)
@@ -301,20 +329,28 @@ polymarket-sniper-bot/
 └── data/                   # Auto-created: orders, trades, logs
     ├── orders.json         # Sniper positions
     ├── v4_trades.json      # Weather bot positions
-    └── tp_log.json         # Take profit sell history
+    ├── tp_log.json         # Take profit sell history
+    ├── maker_trades.json   # Maker bot fill history
+    ├── maker_pending.json  # Live pending orders (used by kill switch)
+    └── maker_state.json    # Persistent W/L + band win rates (survives restarts)
 ```
 
 ## Safety Features
 
 | Guard | Weather Bot | Crypto Maker |
 |-------|------------|--------------|
-| Daily bankroll cap | $50 | $50 |
-| Daily loss limit | — | $25 |
+| Daily bankroll cap | $50 | $100 |
+| Daily loss limit | — | $80 |
 | Max drawdown | 35% (circuit breaker) | — |
 | Loss streak pause | 5 losses → 30 min | 3 losses → 60 min |
 | Win rate floor | Halts if <30% after 10 trades | — |
 | Model sanity check | Skip if model vs market >40% apart | Skip if <0.1% price move |
-| Telegram alerts | Every trade/win/loss/halt | Every trade/win/loss/halt |
+| Smart money filter | — | Skip if Allium whales contradict direction |
+| Bid price auto-cap | — | Caps bid at `observed_win_rate - 5%` per confidence band (≥10 trades) |
+| Chase ceiling | — | Never exceeds `bid_price` regardless of orderbook |
+| Redemption failure | — | Caught + Telegram alert, trading continues |
+| State file corruption | — | Discards + starts fresh, logs warning |
+| Telegram alerts | Every trade/win/loss/halt | Every trade/win/loss/halt/redeem |
 
 ## Research & References
 

@@ -139,26 +139,43 @@ def tool_read_logs(lines: int = 30, service: str = "polymarket-bot") -> str:
         return f"Error reading logs: {e}"
 
 
+def _get_bot_command(pid: str) -> str:
+    """Return the subcommand bot.py was launched with (tp, dual, bracket, maker, run, etc.)"""
+    try:
+        result = subprocess.run(["ps", "-p", pid, "-o", "args="], capture_output=True, text=True)
+        args = result.stdout.strip()
+        for cmd in ("dual", "bracket", "maker", "tp", "run", "scan"):
+            if cmd in args:
+                return cmd
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
 def tool_bot_status() -> str:
     """Get bot status by checking running processes."""
     lines = []
-    for service, label in [("polymarket-bot", "Weather Bot"), ("crypto-maker", "Crypto Maker")]:
-        script = LOCAL_SCRIPTS[service]
-        pid = _find_pid(script)
-        if pid:
-            # Get memory usage via ps
-            mem_result = subprocess.run(
-                ["ps", "-o", "rss=", "-p", pid],
-                capture_output=True, text=True,
-            )
-            try:
-                mem_mb = int(mem_result.stdout.strip()) / 1024
-                mem_str = f"{mem_mb:.0f}MB"
-            except (ValueError, TypeError):
-                mem_str = "?"
-            lines.append(f"🟢 {label}: Running (PID {pid}, {mem_str} RAM)")
-        else:
-            lines.append(f"🔴 {label}: Not running")
+    pid = _find_pid("bot.py")
+    if pid:
+        mem_result = subprocess.run(["ps", "-o", "rss=", "-p", pid], capture_output=True, text=True)
+        try:
+            mem_mb = int(mem_result.stdout.strip()) / 1024
+            mem_str = f"{mem_mb:.0f}MB"
+        except (ValueError, TypeError):
+            mem_str = "?"
+        cmd = _get_bot_command(pid)
+        strategy_names = {
+            "tp": "Sniper + Take Profit",
+            "dual": "Weather + Crypto Maker (dual)",
+            "bracket": "Weather Bracket Bot",
+            "maker": "Crypto Maker Bot",
+            "run": "Legacy Sniper (v1)",
+            "scan": "Scan only (no trading)",
+        }
+        label = strategy_names.get(cmd, f"bot.py {cmd}")
+        lines.append(f"🟢 {label}: Running (PID {pid}, {mem_str} RAM)")
+    else:
+        lines.append(f"🔴 Bot: Not running")
 
     # Show last bankroll line from log if available
     if LOG_FILE.exists():
@@ -299,6 +316,21 @@ def tool_run_command(command: str) -> str:
         return "Command timed out (30s limit)"
     except Exception as e:
         return f"Error: {e}"
+
+
+def tool_kill_switch() -> str:
+    """Emergency: cancel all open orders and sell all positions."""
+    try:
+        from take_profit import kill_switch
+        from trader import init_client
+        client = init_client(
+            PRIVATE_KEY,
+            signature_type=int(os.getenv("SIGNATURE_TYPE", "2")),
+            funder=os.getenv("FUNDER"),
+        )
+        return kill_switch(client)
+    except Exception as e:
+        return f"❌ Kill switch error: {e}"
 
 
 def tool_tp_status() -> str:
@@ -443,6 +475,11 @@ TOOLS = [
         "description": "Show open positions vs take profit threshold and recent TP sells.",
         "input_schema": {"type": "object", "properties": {}}
     },
+    {
+        "name": "kill_switch",
+        "description": "Emergency kill switch: cancel ALL open orders and sell ALL open positions immediately. Use when user says 'kill', 'exit all', 'close everything', 'emergency stop'.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -457,37 +494,42 @@ TOOL_HANDLERS = {
     "list_files": lambda args: tool_list_files(args.get("directory", ".")),
     "deploy_restart": lambda args: tool_deploy_restart(),
     "tp_status": lambda args: tool_tp_status(),
+    "kill_switch": lambda args: tool_kill_switch(),
 }
 
 SYSTEM_PROMPT = """You are the remote control AI for a Polymarket trading bot running locally on a Mac (not a Linux server).
 
-The bot trades weather temperature brackets on Polymarket using a GFS 31-member ensemble forecast model.
-It's written in Python and runs locally on a Mac (not as a systemd service).
-Use bot_status, read_logs, restart_bot, pause_bot, resume_bot tools normally — they work via local process management.
+## Available strategies (python bot.py <command>):
+- `bracket` — Weather bracket bot (GFS 31-member ensemble, temperature brackets)
+- `maker` — Crypto maker bot (15-min BTC/ETH/SOL up/down markets)
+- `dual` — Weather + crypto maker running in parallel
+- `tp` — Sniper + Take Profit (buys outcomes $0.005-$0.025, sells at +40% gain)
+- `run` — Legacy v1 sniper (no take profit)
 
-Key files:
-- arb_engine_v4.py — Weather bracket engine (GFS ensemble scoring, order execution)
-- arb_engine_v5_maker.py — Crypto maker engine (15-min BTC/ETH/SOL windows)
-- take_profit.py — Take profit monitor (sells positions when gain > TP_THRESHOLD)
-- bracket_model.py — Probability models (ensemble counting, normal distribution fallback)
-- bracket_markets.py — Market discovery from Polymarket Gamma API
-- noaa_feed.py — Weather data (GFS ensemble from Open-Meteo + NOAA forecasts)
-- bot.py — CLI entry point (run/scan/bracket/maker/dual)
-- .env — Configuration (DO NOT share secrets)
+## IMPORTANT RULES:
+1. For ANY question about what is running, which strategy is active, current config values, or current status — ALWAYS call `read_logs` first. The startup banner in the log shows the exact strategy name and all config values. Never answer these questions from code files — the code contains ALL strategies, not just the running one.
+2. Only use `read_file` when asked to diagnose a bug, understand logic, or make a code change — not to answer "what is running" questions.
+3. `bot_status` tells you if the process is alive and the PID. `read_logs` tells you what it's actually doing.
+
+## Key files:
+- bot.py — CLI entry point. The command used to launch it determines which strategy is active.
+- arb_engine_v4.py — Weather bracket engine
+- arb_engine_v5_maker.py — Crypto maker engine
+- take_profit.py — Take profit engine (monitors positions, sells at TP_THRESHOLD gain)
 - data/tp_log.json — Take profit sell history
 - data/v4_trades.json — Weather bot trade history
+- data/orders.json — Sniper buy history
+- bot.log — Live bot output (startup banner shows exact config values in use)
 
-You can:
-1. Read logs to diagnose issues
-2. Check bot status (use tp_status for take profit positions)
-3. Read and edit source code files
+## You can:
+1. Check what's running via bot_status + read_logs
+2. Use tp_status to see open positions vs TP threshold
+3. Read and edit source files for debugging/changes
 4. Restart the bot after changes
 5. Run shell commands for debugging
 
-Keep responses concise — this is Telegram, not a full IDE. Use short paragraphs.
-When making code changes, always explain what you're changing and why, then restart the bot.
-Never share API keys, private keys, or other secrets.
-If a question is outside the scope of the trading bot (e.g. general weather, news, unrelated topics), say so immediately without using any tools."""
+Keep responses concise — this is Telegram. Never share API keys, private keys, or secrets.
+If a question is outside the scope of the trading bot, say so immediately without using tools."""
 
 
 def call_claude(user_message: str, chat_id: str) -> str:
@@ -589,6 +631,8 @@ def handle_quick_command(command: str) -> str | None:
         return tool_resume_bot()
     elif cmd == "/tp":
         return tool_tp_status()
+    elif cmd == "/kill":
+        return tool_kill_switch()
     elif cmd == "/help":
         return (
             "*Polymarket Bot Remote Control*\n\n"
@@ -596,6 +640,7 @@ def handle_quick_command(command: str) -> str | None:
             "`/status` — Bot status & uptime\n"
             "`/logs` — Recent log lines\n"
             "`/tp` — Take profit positions & sells\n"
+            "`/kill` — 🚨 Cancel all orders + sell all positions\n"
             "`/restart` — Restart the bot\n"
             "`/pause` — Stop trading\n"
             "`/resume` — Resume trading\n"

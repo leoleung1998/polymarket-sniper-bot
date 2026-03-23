@@ -59,10 +59,17 @@ def fetch_active_events() -> list[dict]:
     return events
 
 
-def find_cheap_outcomes(events: list[dict], min_price: float = 0.005, max_price: float = 0.03) -> list[CheapOutcome]:
+def find_cheap_outcomes(
+    events: list[dict],
+    min_price: float = 0.005,
+    max_price: float = 0.03,
+    min_volume: float = 0,
+    min_liquidity: float = 0,
+) -> list[CheapOutcome]:
     """
     Scan events for outcomes priced between min_price and max_price.
-    min_price filters out dead/illiquid markets and respects Polymarket minimums.
+    min_volume: skip markets with lifetime volume below this (USDC).
+    min_liquidity: skip markets with current liquidity below this (USDC).
     """
     cheap = []
 
@@ -70,6 +77,18 @@ def find_cheap_outcomes(events: list[dict], min_price: float = 0.005, max_price:
         event_title = event.get("title", "Unknown")
 
         for market in event.get("markets", []):
+            # Volume / liquidity filter
+            try:
+                volume = float(market.get("volumeNum") or market.get("volume") or 0)
+                liquidity = float(market.get("liquidityNum") or market.get("liquidity") or 0)
+            except (ValueError, TypeError):
+                volume, liquidity = 0, 0
+
+            if min_volume > 0 and volume < min_volume:
+                continue
+            if min_liquidity > 0 and liquidity < min_liquidity:
+                continue
+
             # These fields come as JSON strings from the API, not lists
             raw_outcomes = market.get("outcomes", "[]")
             raw_prices = market.get("outcomePrices", "[]")
@@ -116,14 +135,27 @@ def find_cheap_outcomes(events: list[dict], min_price: float = 0.005, max_price:
     return cheap
 
 
-def scan(min_price: float = 0.005, max_price: float = 0.03) -> list[CheapOutcome]:
+def scan(
+    min_price: float = 0.005,
+    max_price: float = 0.03,
+    min_volume: float = 0,
+    min_liquidity: float = 0,
+) -> list[CheapOutcome]:
     """Full scan: fetch events, find cheap outcomes."""
     print(f"[scanner] Fetching active events from Polymarket...")
     events = fetch_active_events()
     print(f"[scanner] Found {len(events)} active events")
 
-    cheap = find_cheap_outcomes(events, min_price=min_price, max_price=max_price)
-    print(f"[scanner] Found {len(cheap)} outcomes priced ${min_price}-${max_price}")
+    cheap = find_cheap_outcomes(
+        events,
+        min_price=min_price,
+        max_price=max_price,
+        min_volume=min_volume,
+        min_liquidity=min_liquidity,
+    )
+    print(f"[scanner] Found {len(cheap)} outcomes priced ${min_price}-${max_price}"
+          + (f" | vol>${min_volume:.0f}" if min_volume else "")
+          + (f" | liq>${min_liquidity:.0f}" if min_liquidity else ""))
 
     return cheap
 

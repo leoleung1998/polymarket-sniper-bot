@@ -99,6 +99,27 @@ def alert_stuck(coin: str, side: str, amount: float, bankroll: float):
     )
 
 
+def alert_sniper_buy(question: str, outcome: str, price: float, shares: float, amount: float):
+    """Alert when a sniper buy order is placed."""
+    _send_async(
+        f"🎯 *SNIPER BUY*\n\n"
+        f"{question[:50]}\n"
+        f"Outcome: {outcome.upper()}\n"
+        f"Price: ${price:.4f} × {shares:.0f} shares\n"
+        f"Cost: ${amount:.2f} USDC"
+    )
+
+
+def alert_sniper_filled(question: str, outcome: str, price: float, shares: float):
+    """Alert when a sniper GTC buy order fills."""
+    _send_async(
+        f"✅ *SNIPER FILLED*\n\n"
+        f"{question[:50]}\n"
+        f"Outcome: {outcome.upper()}\n"
+        f"Filled: {shares:.0f} shares @ ${price:.4f}"
+    )
+
+
 def alert_take_profit(question: str, side: str, buy_price: float, sell_price: float, shares: float, gain_pct: float):
     """Alert when a position is sold via take profit."""
     pnl = (sell_price - buy_price) * shares
