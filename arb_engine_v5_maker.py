@@ -51,6 +51,7 @@ from crypto_markets import (
     get_current_window_timestamp, get_next_window_timestamp,
 )
 from poly_feed import poly_feed, poll_poly_prices
+from poly_ws import ws_feed, ws_silence_watchdog
 from trader import init_client, PlacedOrder, save_order
 from vpn import ensure_vpn
 import telegram_alerts as tg
@@ -789,14 +790,23 @@ async def run_maker_bot():
     # Start Binance WebSocket in background
     ws_task = asyncio.create_task(connect_binance())
 
-    # Start Polymarket price poller in background (one bulk call every 5s)
-    poly_task = asyncio.create_task(poll_poly_prices(MAKER_COINS))
+    # Pre-discover all markets so WS has tokens to subscribe to from the start
+    console.print("[dim]Discovering active markets for WS subscription...[/dim]")
+    for _coin in MAKER_COINS:
+        _market = discover_market(_coin)
+        if _market:
+            ws_feed.register_tokens(_coin, _market.up_token_id, _market.down_token_id)
+            console.print(f"[dim]  {_coin}: registered {_market.question}[/dim]")
+
+    # Start Polymarket WS price feed (replaces REST poll — real-time push)
+    poly_task = asyncio.create_task(ws_feed.run(MAKER_COINS))
+    asyncio.create_task(ws_silence_watchdog(ws_feed, MAKER_COINS))
 
     # Hot-reload .env every 15s — no restart needed for config changes
     _start_config_watcher()
-    console.print("[dim]Polymarket price feed started (polling every 5s)[/dim]")
+    console.print("[dim]Polymarket price feed started (WebSocket — real-time)[/dim]")
 
-    # Wait a moment for WebSocket to connect
+    # Wait a moment for WebSocket to connect and receive initial prices
     await asyncio.sleep(3)
 
     last_status_print = 0.0
@@ -1033,6 +1043,10 @@ async def run_maker_bot():
                         window.order_placed = True
                         continue
 
+                    # Register new tokens with WS feed so it subscribes to this window
+                    ws_feed.register_tokens(coin, market.up_token_id, market.down_token_id)
+                    await ws_feed.flush_pending_tokens()
+
                     if PAPER_TRADE:
                         # Paper trade — simulate the order
                         _now = datetime.now(timezone.utc)
@@ -1189,7 +1203,7 @@ async def run_maker_bot():
                         poly_lines.append(f"{c} ↑${up:.2f} ↓${down:.2f}")
                     else:
                         poly_lines.append(f"{c} (stale)")
-                console.print(f"  [dim]Poly odds: {' | '.join(poly_lines)} ({poly_feed.stats})[/dim]")
+                console.print(f"  [dim]Poly odds: {' | '.join(poly_lines)} ({ws_feed.stats})[/dim]")
 
             # Fast poll — check every second near window boundaries
             await asyncio.sleep(1)
