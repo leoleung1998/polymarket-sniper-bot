@@ -254,6 +254,9 @@ All settings are in `.env`. Defaults work out of the box — only `PRIVATE_KEY` 
 | `MAKER_ENTRY_SECONDS` | `480` | Enter at T-480s (8 min) before close |
 | `MAKER_LOSS_STREAK_LIMIT` | `3` | Pause after 3 consecutive losses |
 | `MAKER_LOSS_COOLDOWN` | `3600` | Cooldown after loss streak (seconds) |
+| `MAKER_TARGET_EV` | `2.0` | Kelly bet target: $EV per trade (scales bet size once band has ≥10 trades) |
+| `MAKER_SIGNAL_SCALE` | `2.0` | Binance→probability divisor: `prob = 0.5 + confidence / scale` (raise to be more conservative) |
+| `MAKER_MIN_GAP` | `0.0` | Min gap between Binance signal and Polymarket price to enter. `0` = any edge, `-0.03` = tolerate 3% lag (more trades), `0.05` = require 5%+ confirmed edge (selective) |
 
 ### Sniper Bot / Take Profit Bot
 
@@ -351,6 +354,161 @@ polymarket-sniper-bot/
 | Redemption failure | — | Caught + Telegram alert, trading continues |
 | State file corruption | — | Discards + starts fresh, logs warning |
 | Telegram alerts | Every trade/win/loss/halt | Every trade/win/loss/halt/redeem |
+
+---
+
+## Quant Notes — Known Weaknesses & Improvement Areas
+
+This section documents the current signal model's assumptions and known limitations, written for a quant who wants to improve the edge.
+
+### 1. Binance Signal → Win Probability (Heuristic, Not Empirical)
+
+**Current formula** (`arb_engine_v5_maker.py`):
+```python
+binance_prob = min(0.98, 0.5 + confidence / MAKER_SIGNAL_SCALE)
+```
+
+Where `confidence` = absolute % price move from 15-min window open to T-480s, and `MAKER_SIGNAL_SCALE` (default `2.0`) controls steepness.
+
+**This is a made-up heuristic.** The derivation:
+- Start at 50% (random baseline — no Binance signal = coin flip)
+- Add `confidence / scale` as a linear confidence boost
+- Cap at 98% (never be fully certain)
+
+**`MAKER_SIGNAL_SCALE` tuning guide:**
+| Scale | confidence=0.5% | confidence=1.0% | Behavior |
+|-------|-----------------|-----------------|----------|
+| 1.0   | 100% (capped)   | 100% (capped)   | Very aggressive — almost always trades |
+| 2.0   | 75%             | 100% (capped)   | Default — balanced |
+| 3.0   | 67%             | 83%             | Conservative — needs larger moves |
+| 4.0   | 63%             | 75%             | Very conservative |
+
+Raise `MAKER_SIGNAL_SCALE` if you're getting too many gap-check skips. Lower it if the bot is trading too aggressively on small moves.
+
+**Example (default scale=2):** ETH moves 0.105% down → `0.5 + 0.105/2 = 55.25%` → rounded to 55%
+
+**The problem:** There is no statistical basis for this formula. A 0.5% move in 8 minutes is historically very predictive (~90%+ win rate in our data), yet the formula only assigns 75% confidence. This causes:
+- Underestimating edge on large moves
+- Over-reliance on the gap check to filter bad trades
+
+**What to replace it with:**
+Run a logistic regression on `maker_trades.json` (fields: `bid_price`, `size`, `cost`, `timestamp`, `outcome`):
+```
+P(win) = sigmoid(β0 + β1 * move_pct + β2 * poly_price + β3 * time_of_day)
+```
+Or simpler: bin trades by move_pct decile, compute empirical win rate per bin, fit a monotone curve.
+
+The band tracking (small/medium/large) is a crude version of this — once you have 50+ trades per band it will partially self-correct via the auto-cap.
+
+---
+
+### 2. Gap Check (Edge Detection)
+
+**Current logic:**
+```python
+gap = binance_prob - poly_price   # must be > 0 to enter
+```
+
+**Problem:** Both inputs are noisy.
+- `binance_prob` is the heuristic above (biased low)
+- `poly_price` is the CLOB mid price (bid/ask midpoint) — but you're buying at the **ask**, not mid
+
+**Improvement:** Use the actual ask price for gap check, not the mid:
+```python
+gap = binance_prob - poly_ask   # more conservative, avoids overpaying spread
+```
+
+Also consider a minimum gap threshold (e.g. gap > 0.05 = 5%) rather than just gap > 0, to account for model uncertainty.
+
+---
+
+### 3. Bid Price Ceiling (Static Bounds + Auto-Cap)
+
+**Current formula:**
+```python
+t = min(1.0, max(0.0, (confidence_pct - MIN_MOVE_PCT) / 0.4))
+bid = BID_LOW + t * (BID_HIGH - BID_LOW)   # linear interpolation: $0.82–$0.88
+```
+
+**Auto-cap** (kicks in after ≥10 trades per band):
+```python
+bid = min(bid, observed_win_rate - 0.05)
+```
+
+**Break-even math:** At bid price `b`, you need win rate `w = b` to break even.
+- Profit per win: `(1 - b) × size`
+- Loss per loss: `b × size`
+- Break-even: `w × (1-b) = (1-w) × b` → `w = b`
+
+So `BID_HIGH = 0.88` requires 88% sustained win rate. With 1 loss every 10 trades (90% win rate), EV per trade = `0.90 × 0.12 - 0.10 × 0.88 = +$0.02/share`.
+
+**Improvement:** Replace static bounds with Kelly criterion bet sizing:
+```python
+edge = win_rate - bid_price          # your edge per dollar
+kelly_bet = edge / (1 - bid_price)   # fraction of bankroll to bet
+```
+This auto-sizes both bid price and bet size based on observed edge.
+
+---
+
+### 4. Optimal Bet Size Formula
+
+To reverse-calculate bet size from observed win rate:
+```python
+def optimal_bet(win_rate, bid=0.85, target_ev=2.0):
+    """
+    Returns bet size (USDC) that generates target_ev dollars EV per trade.
+    Returns min_bet if no edge exists at this bid price.
+    """
+    edge = win_rate * (1 / bid - 1) - (1 - win_rate)
+    if edge <= 0:
+        return min_bet
+    return round(min(max_bet, max(min_bet, target_ev / edge)), 2)
+```
+
+`target_ev` is set via `MAKER_TARGET_EV` env var (default `2.0` = target $2 EV per trade).
+
+Example at 90% win rate, $0.85 bid, `MAKER_TARGET_EV=2.0`:
+```
+edge = 0.90 × (1/0.85 - 1) - 0.10 = 0.90 × 0.176 - 0.10 = 0.059
+bet  = 2.0 / 0.059 ≈ $33.90
+```
+
+**`MAKER_TARGET_EV` tuning guide:**
+- `1.0` → smaller bets, more conservative sizing
+- `2.0` → default — balanced risk/reward
+- `5.0` → larger bets when edge is confirmed (high win rate bands)
+
+Note: bet is always clamped to `[MAKER_BET_SIZE, MAKER_MAX_BET]`, so Kelly only matters once the band has ≥10 trades.
+
+---
+
+### 5. Time-of-Day Signal
+
+Not currently used. Hypothesis: Polymarket is less efficient at pricing crypto moves during low-liquidity hours (03:00–08:00 UTC) — more edge available. High-liquidity hours (13:00–21:00 UTC, US market hours) → Polymarket prices in moves faster → more skips. Worth adding `hour_of_day` as a feature.
+
+---
+
+### 6. Data Available for Model Training
+
+All trades are logged to `data/maker_trades.json`:
+```json
+{
+  "type": "maker_fill",
+  "coin": "BTC",
+  "direction": "up",
+  "bid_price": 0.82,
+  "size": 36.58,
+  "cost": 29.99,
+  "timestamp": "2026-03-23T21:45:05Z"
+}
+```
+
+Outcome records (`type: "maker_outcome"`) include win/loss. Join on timestamp to get full feature set. Target variable: `outcome == "win"`. Features available: `coin`, `direction`, `bid_price`, `move_pct` (from log), `poly_price` (from log), `time_of_day`, `conf_band`.
+
+Currently ~10 trades. Need 200+ per band for statistically significant model fitting.
+
+---
 
 ## Research & References
 

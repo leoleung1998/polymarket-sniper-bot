@@ -36,6 +36,7 @@ import asyncio
 import json
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -120,7 +121,89 @@ MAKER_BID_PRICE_HIGH = float(os.getenv("MAKER_BID_PRICE_HIGH", "0.95"))  # Bid r
 MAKER_ENTRY_SECONDS = int(os.getenv("MAKER_ENTRY_SECONDS", "120"))    # Enter at T-120s (2 min before close)
 MAKER_LOSS_STREAK_LIMIT = int(os.getenv("MAKER_LOSS_STREAK_LIMIT", "3"))
 MAKER_LOSS_COOLDOWN = int(os.getenv("MAKER_LOSS_COOLDOWN", "3600"))    # 1 hour
+MAKER_TARGET_EV = float(os.getenv("MAKER_TARGET_EV", "2.0"))          # target $EV per trade for Kelly sizing
+MAKER_SIGNAL_SCALE = float(os.getenv("MAKER_SIGNAL_SCALE", "2.0"))    # divisor in binance_prob formula
+MAKER_MIN_GAP = float(os.getenv("MAKER_MIN_GAP", "0.0"))              # min gap to enter (0 = any edge, -0.03 = tolerate 3% lag)
 PAPER_TRADE = os.getenv("PAPER_TRADE", "false").lower() == "true"     # Simulate trades without real money
+
+# ── Hot-reload config (watches .env for changes every 15s) ──────────────────
+_ENV_FILE = Path(__file__).parent / ".env"
+_env_mtime: float = 0.0
+
+
+def _reload_config() -> None:
+    """Re-read tunable .env vars without restarting. No-op if file unchanged."""
+    global _env_mtime
+    global MAKER_BET_SIZE, MAKER_MAX_BET, MAKER_DAILY_BANKROLL, MAKER_DAILY_LOSS_LIMIT
+    global MAKER_MIN_MOVE_PCT, MAKER_BID_PRICE_LOW, MAKER_BID_PRICE_HIGH
+    global MAKER_ENTRY_SECONDS, MAKER_LOSS_STREAK_LIMIT, MAKER_LOSS_COOLDOWN
+    global MAKER_TARGET_EV, MAKER_SIGNAL_SCALE, MAKER_QUIET_HOURS_START, MAKER_QUIET_HOURS_END
+    global MAKER_MIN_GAP
+
+    try:
+        mtime = _ENV_FILE.stat().st_mtime
+    except OSError:
+        return
+    if mtime == _env_mtime:
+        return  # file unchanged — skip
+
+    load_dotenv(override=True)
+    _env_mtime = mtime
+
+    prev = dict(
+        MAKER_BET_SIZE=MAKER_BET_SIZE, MAKER_MAX_BET=MAKER_MAX_BET,
+        MAKER_DAILY_BANKROLL=MAKER_DAILY_BANKROLL, MAKER_DAILY_LOSS_LIMIT=MAKER_DAILY_LOSS_LIMIT,
+        MAKER_MIN_MOVE_PCT=MAKER_MIN_MOVE_PCT, MAKER_BID_PRICE_LOW=MAKER_BID_PRICE_LOW,
+        MAKER_BID_PRICE_HIGH=MAKER_BID_PRICE_HIGH, MAKER_ENTRY_SECONDS=MAKER_ENTRY_SECONDS,
+        MAKER_LOSS_STREAK_LIMIT=MAKER_LOSS_STREAK_LIMIT, MAKER_LOSS_COOLDOWN=MAKER_LOSS_COOLDOWN,
+        MAKER_TARGET_EV=MAKER_TARGET_EV, MAKER_SIGNAL_SCALE=MAKER_SIGNAL_SCALE,
+        MAKER_MIN_GAP=MAKER_MIN_GAP,
+        MAKER_QUIET_HOURS_START=MAKER_QUIET_HOURS_START, MAKER_QUIET_HOURS_END=MAKER_QUIET_HOURS_END,
+    )
+
+    MAKER_BET_SIZE           = float(os.getenv("MAKER_BET_SIZE", "3.0"))
+    MAKER_MAX_BET            = float(os.getenv("MAKER_MAX_BET", "5.0"))
+    MAKER_DAILY_BANKROLL     = float(os.getenv("MAKER_DAILY_BANKROLL", "50.0"))
+    MAKER_DAILY_LOSS_LIMIT   = float(os.getenv("MAKER_DAILY_LOSS_LIMIT", "25.0"))
+    MAKER_MIN_MOVE_PCT       = float(os.getenv("MAKER_MIN_MOVE_PCT", "0.10"))
+    MAKER_BID_PRICE_LOW      = float(os.getenv("MAKER_BID_PRICE_LOW", "0.88"))
+    MAKER_BID_PRICE_HIGH     = float(os.getenv("MAKER_BID_PRICE_HIGH", "0.95"))
+    MAKER_ENTRY_SECONDS      = int(os.getenv("MAKER_ENTRY_SECONDS", "120"))
+    MAKER_LOSS_STREAK_LIMIT  = int(os.getenv("MAKER_LOSS_STREAK_LIMIT", "3"))
+    MAKER_LOSS_COOLDOWN      = int(os.getenv("MAKER_LOSS_COOLDOWN", "3600"))
+    MAKER_TARGET_EV          = float(os.getenv("MAKER_TARGET_EV", "2.0"))
+    MAKER_SIGNAL_SCALE       = float(os.getenv("MAKER_SIGNAL_SCALE", "2.0"))
+    MAKER_MIN_GAP            = float(os.getenv("MAKER_MIN_GAP", "0.0"))
+    MAKER_QUIET_HOURS_START  = int(os.getenv("MAKER_QUIET_HOURS_START", "0"))
+    MAKER_QUIET_HOURS_END    = int(os.getenv("MAKER_QUIET_HOURS_END", "7"))
+
+    new = dict(
+        MAKER_BET_SIZE=MAKER_BET_SIZE, MAKER_MAX_BET=MAKER_MAX_BET,
+        MAKER_DAILY_BANKROLL=MAKER_DAILY_BANKROLL, MAKER_DAILY_LOSS_LIMIT=MAKER_DAILY_LOSS_LIMIT,
+        MAKER_MIN_MOVE_PCT=MAKER_MIN_MOVE_PCT, MAKER_BID_PRICE_LOW=MAKER_BID_PRICE_LOW,
+        MAKER_BID_PRICE_HIGH=MAKER_BID_PRICE_HIGH, MAKER_ENTRY_SECONDS=MAKER_ENTRY_SECONDS,
+        MAKER_LOSS_STREAK_LIMIT=MAKER_LOSS_STREAK_LIMIT, MAKER_LOSS_COOLDOWN=MAKER_LOSS_COOLDOWN,
+        MAKER_TARGET_EV=MAKER_TARGET_EV, MAKER_SIGNAL_SCALE=MAKER_SIGNAL_SCALE,
+        MAKER_MIN_GAP=MAKER_MIN_GAP,
+        MAKER_QUIET_HOURS_START=MAKER_QUIET_HOURS_START, MAKER_QUIET_HOURS_END=MAKER_QUIET_HOURS_END,
+    )
+    changes = [f"{k}: {prev[k]} → {new[k]}" for k in prev if new[k] != prev[k]]
+    if changes:
+        msg = "Config reloaded: " + " | ".join(changes)
+        console.print(f"[cyan]{msg}[/cyan]")
+        tg.send(msg)
+
+
+def _start_config_watcher() -> None:
+    def _loop():
+        while True:
+            time.sleep(15)
+            try:
+                _reload_config()
+            except Exception:
+                pass
+    threading.Thread(target=_loop, daemon=True, name="config-watcher").start()
+
 
 # Logging
 LOG_DIR = Path("data")
@@ -305,11 +388,48 @@ class MakerBankroll:
             if saved_date == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
                 b.daily_losses = float(state.get("daily_losses", 0.0))
 
+            # Rebuild band stats from full trade history (never lost on restart)
+            b._rebuild_from_trades()
+
             console.print(f"[dim]Restored session: W/L {b.wins}/{b.losses} ({b.win_rate:.0%}) | ${b.balance:.2f} | Bands: {b.band_stats()}[/dim]")
 
         except Exception as e:
             console.print(f"[yellow]State load failed ({e}) — starting fresh[/yellow]")
+            b._rebuild_from_trades()
         return b
+
+    def _rebuild_from_trades(self):
+        """Rebuild W/L and band stats from maker_trades.json (source of truth)."""
+        try:
+            if not TRADES_FILE.exists():
+                return
+            trades = json.loads(TRADES_FILE.read_text())
+            outcomes = [t for t in trades if t.get("type") == "maker_outcome"]
+            if not outcomes:
+                return
+
+            wins = sum(1 for t in outcomes if t.get("outcome") == "win")
+            losses = sum(1 for t in outcomes if t.get("outcome") == "loss")
+            band_wins: dict = {}
+            band_losses: dict = {}
+            for t in outcomes:
+                band = t.get("band", "")
+                if not band:
+                    continue
+                if t.get("outcome") == "win":
+                    band_wins[band] = band_wins.get(band, 0) + 1
+                else:
+                    band_losses[band] = band_losses.get(band, 0) + 1
+
+            # Only override if trades file has more data than state file
+            if wins + losses > self.wins + self.losses:
+                self.wins = wins
+                self.losses = losses
+                self.band_wins = band_wins
+                self.band_losses = band_losses
+                console.print(f"[dim]Rebuilt from {len(outcomes)} trade records: W/L {wins}/{losses} | Bands: {self.band_stats()}[/dim]")
+        except Exception as e:
+            console.print(f"[yellow]Trade history rebuild failed ({e})[/yellow]")
 
     def band_stats(self) -> str:
         """Per-band win rate summary for logging."""
@@ -381,6 +501,20 @@ def detect_direction(coin: str, window_start_price: float) -> tuple[str | None, 
     return direction, abs(pct_move), current
 
 
+def optimal_bet(win_rate: float, bid: float, min_bet: float, max_bet: float, target_ev: float = 2.0) -> float:
+    """
+    Kelly-derived bet size: how much to bet given observed win rate and bid price.
+    Returns a bet sized to generate target_ev dollars EV per trade.
+    Always clamped to [min_bet, max_bet].
+    Falls back to min_bet when there's no edge.
+    """
+    edge = win_rate * (1 / bid - 1) - (1 - win_rate)
+    if edge <= 0:
+        return min_bet  # no edge — bet minimum
+    bet = target_ev / edge
+    return round(min(max_bet, max(min_bet, bet)), 2)
+
+
 def calculate_bid_price(confidence_pct: float, bankroll: "MakerBankroll" = None) -> tuple[float, str]:
     """
     Calculate maker bid price based on confidence and observed band win rate.
@@ -424,8 +558,10 @@ async def place_maker_order(
     direction: str,
     bid_price: float,
     bet_amount: float,
+    silent: bool = False,
 ) -> dict | None:
-    """Place a GTC maker limit order on the predicted winning side."""
+    """Place a GTC maker limit order on the predicted winning side.
+    silent=True suppresses Telegram — used for chase replacements."""
     from py_clob_client.clob_types import OrderArgs, OrderType
     from py_clob_client.order_builder.constants import BUY
 
@@ -482,7 +618,8 @@ async def place_maker_order(
         )
         console.print(f"[cyan]  {msg}[/cyan]")
         log_trade(msg)
-        tg.send_message(f"📋 MAKER BID\n{market.coin} {side_label}\n${bid_price:.2f} × {size:.0f} shares\n${actual_cost:.2f} USDC\n💰 Balance: {get_poly_balance()}")
+        if not silent:
+            tg.send_message(f"📋 {market.coin} {side_label} @ ${bid_price:.2f} × {size:.0f} shares (${actual_cost:.2f})")
 
         return order_info
 
@@ -642,6 +779,9 @@ async def run_maker_bot():
 
     # Start Polymarket price poller in background (one bulk call every 5s)
     poly_task = asyncio.create_task(poll_poly_prices(MAKER_COINS))
+
+    # Hot-reload .env every 15s — no restart needed for config changes
+    _start_config_watcher()
     console.print("[dim]Polymarket price feed started (polling every 5s)[/dim]")
 
     # Wait a moment for WebSocket to connect
@@ -689,15 +829,29 @@ async def run_maker_bot():
                             token_price = get_current_price(order["token_id"])
                             if token_price is not None and token_price >= 0.90:
                                 payout = order["size"] * 1.0
-                                bankroll.record_win(order["cost"], payout, band=order.get("conf_band", ""))
+                                band = order.get("conf_band", "")
+                                bankroll.record_win(order["cost"], payout, band=band)
                                 ptag = "📝 PAPER " if is_paper else ""
                                 console.print(f"  [bold green]🎯 {ptag}{coin} WIN! +${payout - order['cost']:.2f}[/bold green]")
-                                tg.send_message(f"🎯 {ptag}MAKER WIN\n{coin} {order['direction'].upper()}\n+${payout - order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}\n💰 Balance: {get_poly_balance()}")
+                                tg.send_message(f"✅ {ptag}{coin} {order['direction'].upper()} WIN +${payout - order['cost']:.2f} | Bank: ${bankroll.balance:.2f}")
+                                save_trade_record({
+                                    "type": "maker_outcome", "outcome": "win", "coin": coin,
+                                    "direction": order["direction"], "band": band,
+                                    "cost": order["cost"], "payout": payout,
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                })
                             elif token_price is not None and token_price <= 0.10:
-                                bankroll.record_loss(order["cost"], band=order.get("conf_band", ""))
+                                band = order.get("conf_band", "")
+                                bankroll.record_loss(order["cost"], band=band)
                                 ptag = "📝 PAPER " if is_paper else ""
                                 console.print(f"  [red]❌ {ptag}{coin} LOSS: -${order['cost']:.2f}[/red]")
-                                tg.send_message(f"❌ {ptag}MAKER LOSS\n{coin} {order['direction'].upper()}\n-${order['cost']:.2f}\nBankroll: ${bankroll.balance:.2f}\n💰 Balance: {get_poly_balance()}")
+                                tg.send_message(f"❌ {ptag}{coin} {order['direction'].upper()} LOSS -${order['cost']:.2f} | Bank: ${bankroll.balance:.2f}")
+                                save_trade_record({
+                                    "type": "maker_outcome", "outcome": "loss", "coin": coin,
+                                    "direction": order["direction"], "band": band,
+                                    "cost": order["cost"], "payout": 0.0,
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                })
                             else:
                                 # Not resolved yet — give the money back for now
                                 console.print(f"  [yellow]{coin}: Resolution unclear (price: {token_price}) — refunding[/yellow]")
@@ -786,16 +940,16 @@ async def run_maker_bot():
                     poly_price = poly_up if direction == "up" else poly_down
                     if poly_price is not None:
                         # Binance-derived win probability (simple: >50% if we're confident)
-                        binance_prob = min(0.98, 0.5 + confidence / 2)
+                        binance_prob = min(0.98, 0.5 + confidence / MAKER_SIGNAL_SCALE)
                         gap = binance_prob - poly_price
-                        gap_color = "green" if gap > 0.05 else "yellow" if gap > 0 else "red"
+                        gap_color = "green" if gap > 0.05 else "yellow" if gap > MAKER_MIN_GAP else "red"
                         console.print(
                             f"  [{gap_color}]Poly {direction.upper()}: ${poly_price:.2f} | "
-                            f"Binance signal: {binance_prob:.0%} | Gap: {gap:+.0%}[/{gap_color}]"
+                            f"Binance signal: {binance_prob:.0%} | Gap: {gap:+.0%} (min={MAKER_MIN_GAP:+.0%})[/{gap_color}]"
                         )
-                        if gap < 0:
+                        if gap < MAKER_MIN_GAP:
                             console.print(
-                                f"  [yellow]{coin}: Polymarket already priced in ({poly_price:.2f} > {binance_prob:.0%}) — SKIP[/yellow]"
+                                f"  [yellow]{coin}: Polymarket already priced in ({poly_price:.2f}, gap {gap:+.0%} < {MAKER_MIN_GAP:+.0%}) — SKIP[/yellow]"
                             )
                             window.order_placed = True
                             continue
@@ -829,11 +983,12 @@ async def run_maker_bot():
                     # Calculate bid price based on confidence + observed band win rate
                     bid_price, conf_band = calculate_bid_price(confidence, bankroll)
 
-                    # Scale bet size with confidence
-                    if confidence >= 0.3:
-                        bet_amount = MAKER_MAX_BET
-                    elif confidence >= 0.2:
-                        bet_amount = (MAKER_BET_SIZE + MAKER_MAX_BET) / 2
+                    # Size bet from observed band win rate (Kelly-derived)
+                    # Falls back to MAKER_BET_SIZE when band has <10 trades
+                    wr = bankroll.band_win_rate(conf_band)
+                    if wr is not None:
+                        bet_amount = optimal_bet(wr, bid_price, MAKER_BET_SIZE, MAKER_MAX_BET, MAKER_TARGET_EV)
+                        console.print(f"  [dim]{coin}: Kelly bet ${bet_amount:.2f} (band={conf_band} wr={wr:.0%})[/dim]")
                     else:
                         bet_amount = MAKER_BET_SIZE
 
@@ -862,14 +1017,8 @@ async def run_maker_bot():
                             f"  [bold yellow]📝 PAPER BID: {coin} {direction.upper()} "
                             f"@ ${bid_price:.2f} | {paper_order['size']:.1f} shares | ${bet_amount:.2f}[/bold yellow]"
                         )
-                        tg.send_message(
-                            f"📝 PAPER BID\n{coin} {direction.upper()} @ ${bid_price:.2f}\n"
-                            f"${bet_amount:.2f} ({paper_order['size']:.1f} shares)"
-                        )
                         window.order_placed = True
                         window.order_info = paper_order
-                        if allium_tag:
-                            tg.send_message(f"🧠 Smart Money{allium_tag}")
                         bankroll.balance -= paper_order["cost"]
                         bankroll.pending_orders.append(paper_order)
                     else:
@@ -895,8 +1044,6 @@ async def run_maker_bot():
                             window.chasing = True
                             window.last_chase_ts = time.time()
                             window.chase_max_price = bid_price
-                            if allium_tag:
-                                tg.send_message(f"🧠 Smart Money{allium_tag}")
                             bankroll.balance -= order_info["cost"]
                             bankroll.pending_orders.append(order_info)
                             save_pending_orders(bankroll.pending_orders)
@@ -930,7 +1077,9 @@ async def run_maker_bot():
                 filled = await check_if_filled(client, order["order_id"])
                 if filled:
                     window.chasing = False
+                    chase_count = round((time.time() - window.last_chase_ts) / CHASE_INTERVAL)
                     console.print(f"  [green]{coin}: Order filled at ${order['bid_price']:.4f}[/green]")
+                    tg.send_message(f"✅ {coin} {order['direction'].upper()} filled @ ${order['bid_price']:.4f} × {order['size']:.0f} shares")
                     continue
 
                 # Not filled — cancel and replace at new best_bid+1tick
@@ -946,6 +1095,7 @@ async def run_maker_bot():
                     order["direction"],
                     new_price,
                     order["cost"],  # same dollar amount
+                    silent=True,    # suppress Telegram on chase replacements
                 )
                 if new_order:
                     new_order["conf_band"] = order.get("conf_band", "")
@@ -987,7 +1137,7 @@ async def run_maker_bot():
                 ]
 
             # Print status every 60s (time-based, not modulo — never misses)
-            if time.time() - last_status_print >= 60:
+            if time.time() - last_status_print >= 10:
                 last_status_print = time.time()
                 console.print(f"  {bankroll.status_line()}")
                 poly_lines = []
@@ -995,8 +1145,9 @@ async def run_maker_bot():
                     up, down = poly_feed.get_market_prices(c)
                     if up and down:
                         poly_lines.append(f"{c} ↑${up:.2f} ↓${down:.2f}")
-                if poly_lines:
-                    console.print(f"  [dim]Poly odds: {' | '.join(poly_lines)} ({poly_feed.stats})[/dim]")
+                    else:
+                        poly_lines.append(f"{c} (stale)")
+                console.print(f"  [dim]Poly odds: {' | '.join(poly_lines)} ({poly_feed.stats})[/dim]")
 
             # Fast poll — check every second near window boundaries
             await asyncio.sleep(1)

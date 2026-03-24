@@ -47,12 +47,16 @@ class PolyPriceFeed:
         return entry.price
 
     def get_market_prices(self, coin: str) -> tuple[float | None, float | None]:
-        """Return (up_price, down_price) for a coin. None if stale/unknown."""
-        up = next((e for e in self._prices.values() if e.coin == coin and e.side == "up"), None)
-        down = next((e for e in self._prices.values() if e.coin == coin and e.side == "down"), None)
-        up_price = up.price if up and not up.is_stale else None
-        down_price = down.price if down and not down.is_stale else None
-        return up_price, down_price
+        """Return (up_price, down_price) for a coin using the most recently updated entry."""
+        up = max(
+            (e for e in self._prices.values() if e.coin == coin and e.side == "up" and not e.is_stale),
+            key=lambda e: e.updated_at, default=None,
+        )
+        down = max(
+            (e for e in self._prices.values() if e.coin == coin and e.side == "down" and not e.is_stale),
+            key=lambda e: e.updated_at, default=None,
+        )
+        return (up.price if up else None), (down.price if down else None)
 
     def poly_implied_prob(self, coin: str, direction: str) -> float | None:
         """
@@ -98,15 +102,39 @@ async def poll_poly_prices(coins: list[str] = None, interval: float = POLL_INTER
     if coins is None:
         coins = list(COIN_SLUGS.keys())
 
+    def _clob_mid(token_id: str) -> float | None:
+        """Fetch real-time mid price from CLOB order book (best bid + best ask / 2)."""
+        try:
+            resp = requests.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": token_id},
+                timeout=4,
+            )
+            resp.raise_for_status()
+            book = resp.json()
+            bids = sorted(book.get("bids", []), key=lambda x: float(x["price"]), reverse=True)
+            asks = sorted(book.get("asks", []), key=lambda x: float(x["price"]))
+            best_bid = float(bids[0]["price"]) if bids else None
+            best_ask = float(asks[0]["price"]) if asks else None
+            if best_bid and best_ask:
+                return round((best_bid + best_ask) / 2, 4)
+            return best_bid or best_ask
+        except Exception:
+            return None
+
     while True:
         for coin in coins:
             try:
                 market = discover_market(coin)
                 if market:
-                    poly_feed.update(market.up_token_id, coin, "up", market.up_price)
-                    poly_feed.update(market.down_token_id, coin, "down", market.down_price)
-            except Exception:
+                    # Use live CLOB mid price — Gamma outcomePrices lags real-time
+                    up_mid   = _clob_mid(market.up_token_id)   or market.up_price
+                    down_mid = _clob_mid(market.down_token_id) or market.down_price
+                    poly_feed.update(market.up_token_id,   coin, "up",   up_mid)
+                    poly_feed.update(market.down_token_id, coin, "down", down_mid)
+            except Exception as e:
                 poly_feed._error_count += 1
+                poly_feed._last_error = str(e)[:80]
 
         poly_feed._poll_count += 1
         poly_feed._last_poll = time.time()
