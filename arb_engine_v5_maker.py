@@ -58,6 +58,11 @@ from allium_feed import allium
 from redeemer import check_and_redeem
 
 load_dotenv()
+# Paper mode: load .env.paper on top of .env (overrides only what you specify)
+if os.getenv("PAPER_TRADE", "false").lower() == "true":
+    _paper_env = Path(__file__).parent / ".env.paper"
+    if _paper_env.exists():
+        load_dotenv(_paper_env, override=True)
 
 
 def get_poly_balance() -> str:
@@ -205,12 +210,12 @@ def _start_config_watcher() -> None:
     threading.Thread(target=_loop, daemon=True, name="config-watcher").start()
 
 
-# Logging
-LOG_DIR = Path("data")
-LOG_FILE = LOG_DIR / "maker_trades.log"
-TRADES_FILE = LOG_DIR / "maker_trades.json"
+# Logging — paper trades go to data/paper/ to keep prod stats clean
+LOG_DIR = Path(os.getenv("PAPER_DATA_DIR", "data/paper")) if PAPER_TRADE else Path("data")
+LOG_FILE     = LOG_DIR / "maker_trades.log"
+TRADES_FILE  = LOG_DIR / "maker_trades.json"
 PENDING_FILE = LOG_DIR / "maker_pending.json"  # live pending orders for kill switch
-STATE_FILE  = LOG_DIR / "maker_state.json"     # persistent W/L + band stats across restarts
+STATE_FILE   = LOG_DIR / "maker_state.json"    # persistent W/L + band stats across restarts
 
 
 def save_pending_orders(orders: list):
@@ -822,6 +827,13 @@ async def run_maker_bot():
                             "direction": order["direction"], "bid_price": order["bid_price"],
                             "size": order["size"], "cost": order["cost"],
                             "timestamp": datetime.now(timezone.utc).isoformat(),
+                            # analysis fields (present on paper trades, None on real)
+                            "move_pct": order.get("move_pct"),
+                            "poly_price": order.get("poly_price"),
+                            "binance_prob": order.get("binance_prob"),
+                            "gap": order.get("gap"),
+                            "entry_seconds": order.get("entry_seconds"),
+                            "hour_utc": order.get("hour_utc"),
                         })
                         # Check resolution — did we win or lose?
                         try:
@@ -839,6 +851,12 @@ async def run_maker_bot():
                                     "direction": order["direction"], "band": band,
                                     "cost": order["cost"], "payout": payout,
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "move_pct": order.get("move_pct"),
+                                    "poly_price": order.get("poly_price"),
+                                    "binance_prob": order.get("binance_prob"),
+                                    "gap": order.get("gap"),
+                                    "entry_seconds": order.get("entry_seconds"),
+                                    "hour_utc": order.get("hour_utc"),
                                 })
                             elif token_price is not None and token_price <= 0.10:
                                 band = order.get("conf_band", "")
@@ -851,6 +869,12 @@ async def run_maker_bot():
                                     "direction": order["direction"], "band": band,
                                     "cost": order["cost"], "payout": 0.0,
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "move_pct": order.get("move_pct"),
+                                    "poly_price": order.get("poly_price"),
+                                    "binance_prob": order.get("binance_prob"),
+                                    "gap": order.get("gap"),
+                                    "entry_seconds": order.get("entry_seconds"),
+                                    "hour_utc": order.get("hour_utc"),
                                 })
                             else:
                                 # Not resolved yet — give the money back for now
@@ -1001,9 +1025,10 @@ async def run_maker_bot():
 
                     if PAPER_TRADE:
                         # Paper trade — simulate the order
+                        _now = datetime.now(timezone.utc)
                         paper_order = {
                             "order_id": f"paper_{coin}_{int(time.time())}",
-                            "token_id": market.up_token if direction == "up" else market.down_token,
+                            "token_id": market.up_token_id if direction == "up" else market.down_token_id,
                             "direction": direction,
                             "bid_price": bid_price,
                             "size": bet_amount / bid_price,
@@ -1012,6 +1037,13 @@ async def run_maker_bot():
                             "conf_band": conf_band,
                             "placed_at": time.time(),
                             "paper": True,
+                            # --- analysis fields ---
+                            "move_pct": round(confidence, 4),
+                            "poly_price": poly_price,
+                            "binance_prob": round(binance_prob, 4) if poly_price is not None else None,
+                            "gap": round(gap, 4) if poly_price is not None else None,
+                            "entry_seconds": MAKER_ENTRY_SECONDS,
+                            "hour_utc": _now.hour,
                         }
                         console.print(
                             f"  [bold yellow]📝 PAPER BID: {coin} {direction.upper()} "

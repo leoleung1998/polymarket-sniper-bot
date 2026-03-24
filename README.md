@@ -406,19 +406,28 @@ The band tracking (small/medium/large) is a crude version of this — once you h
 
 **Current logic:**
 ```python
-gap = binance_prob - poly_price   # must be > 0 to enter
+gap = binance_prob - poly_price   # skip if gap < MAKER_MIN_GAP
 ```
 
-**Problem:** Both inputs are noisy.
-- `binance_prob` is the heuristic above (biased low)
-- `poly_price` is the CLOB mid price (bid/ask midpoint) — but you're buying at the **ask**, not mid
+`poly_price` is the **CLOB mid price** (best bid + best ask / 2) — fetched live every 5s. This replaced the old Gamma `outcomePrices` (last traded price) which could be minutes stale and caused false-positive entries.
 
-**Improvement:** Use the actual ask price for gap check, not the mid:
+**`MAKER_MIN_GAP` tuning:**
+| Value | Behaviour |
+|-------|-----------|
+| `0.0` (default) | Enter only when Binance signal > Polymarket price — strict, fewest trades |
+| `-0.03` | Tolerate up to 3% lag in signal — more trades, accepts slightly worse edge |
+| `0.05` | Require 5%+ confirmed edge — very selective, highest quality entries |
+
+If you're getting too many "already priced in" skips, lower `MAKER_MIN_GAP` (e.g. `-0.02`). If you're taking losing trades where Polymarket was ahead of you, raise it.
+
+**Further improvement:** Both inputs are noisy.
+- `binance_prob` is the heuristic above (biased — see §1)
+- `poly_price` is the CLOB mid — but you're buying at the **ask**, not mid
+
+Use the actual ask price for a more conservative check:
 ```python
-gap = binance_prob - poly_ask   # more conservative, avoids overpaying spread
+gap = binance_prob - poly_ask   # avoids overpaying spread
 ```
-
-Also consider a minimum gap threshold (e.g. gap > 0.05 = 5%) rather than just gap > 0, to account for model uncertainty.
 
 ---
 
