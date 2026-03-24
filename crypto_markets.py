@@ -16,6 +16,8 @@ COIN_SLUGS = {
     "BTC": "btc-updown-15m",
     "ETH": "eth-updown-15m",
     "SOL": "sol-updown-15m",
+    "XRP": "xrp-updown-15m",
+    "BNB": "bnb-updown-15m",
 }
 
 WINDOW_SECONDS = 900  # 15 minutes
