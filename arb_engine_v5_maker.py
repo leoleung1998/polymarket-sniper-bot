@@ -116,8 +116,9 @@ MAKER_COINS = os.getenv("MAKER_COINS", "BTC,ETH").split(",")  # SOL dropped — 
 # Low-liquidity hours (UTC) — skip trading when reversals are common
 MAKER_QUIET_HOURS_START = int(os.getenv("MAKER_QUIET_HOURS_START", "0"))   # midnight UTC
 MAKER_QUIET_HOURS_END = int(os.getenv("MAKER_QUIET_HOURS_END", "7"))      # 7am UTC
-MAKER_BET_SIZE = float(os.getenv("MAKER_BET_SIZE", "3.0"))        # $3 per trade
-MAKER_MAX_BET = float(os.getenv("MAKER_MAX_BET", "5.0"))          # $5 max
+MAKER_BET_SIZE = float(os.getenv("MAKER_BET_SIZE", "3.0"))        # $3 min bet (floor)
+MAKER_MAX_BET = float(os.getenv("MAKER_MAX_BET", "5.0"))          # $5 max bet (ceiling)
+MAKER_BET_PCT = float(os.getenv("MAKER_BET_PCT", "0.0"))          # % of balance per trade (0 = use fixed MAKER_BET_SIZE)
 MAKER_DAILY_BANKROLL = float(os.getenv("MAKER_DAILY_BANKROLL", "50.0"))
 MAKER_DAILY_LOSS_LIMIT = float(os.getenv("MAKER_DAILY_LOSS_LIMIT", "25.0"))
 MAKER_MIN_MOVE_PCT = float(os.getenv("MAKER_MIN_MOVE_PCT", "0.10"))   # 0.1% min price move
@@ -140,7 +141,7 @@ _env_mtime: float = 0.0
 def _reload_config() -> None:
     """Re-read tunable .env vars without restarting. No-op if file unchanged."""
     global _env_mtime
-    global MAKER_BET_SIZE, MAKER_MAX_BET, MAKER_DAILY_BANKROLL, MAKER_DAILY_LOSS_LIMIT
+    global MAKER_BET_SIZE, MAKER_MAX_BET, MAKER_BET_PCT, MAKER_DAILY_BANKROLL, MAKER_DAILY_LOSS_LIMIT
     global MAKER_MIN_MOVE_PCT, MAKER_BID_PRICE_LOW, MAKER_BID_PRICE_HIGH
     global MAKER_ENTRY_SECONDS, MAKER_LOSS_STREAK_LIMIT, MAKER_LOSS_COOLDOWN
     global MAKER_TARGET_EV, MAKER_SIGNAL_SCALE, MAKER_QUIET_HOURS_START, MAKER_QUIET_HOURS_END
@@ -173,6 +174,7 @@ def _reload_config() -> None:
 
     MAKER_BET_SIZE           = float(os.getenv("MAKER_BET_SIZE", "3.0"))
     MAKER_MAX_BET            = float(os.getenv("MAKER_MAX_BET", "5.0"))
+    MAKER_BET_PCT            = float(os.getenv("MAKER_BET_PCT", "0.0"))
     MAKER_DAILY_BANKROLL     = float(os.getenv("MAKER_DAILY_BANKROLL", "50.0"))
     MAKER_DAILY_LOSS_LIMIT   = float(os.getenv("MAKER_DAILY_LOSS_LIMIT", "25.0"))
     MAKER_MIN_MOVE_PCT       = float(os.getenv("MAKER_MIN_MOVE_PCT", "0.10"))
@@ -1012,14 +1014,17 @@ async def run_maker_bot():
                     # Calculate bid price based on confidence + observed band win rate
                     bid_price, conf_band = calculate_bid_price(confidence, bankroll)
 
-                    # Size bet from observed band win rate (Kelly-derived)
-                    # Falls back to MAKER_BET_SIZE when band has <10 trades
+                    # Size bet: fractional bankroll if MAKER_BET_PCT set, else fixed floor
+                    base_bet = round(bankroll.balance * MAKER_BET_PCT, 2) if MAKER_BET_PCT > 0 else MAKER_BET_SIZE
+                    base_bet = max(MAKER_BET_SIZE, min(MAKER_MAX_BET, base_bet))
+
+                    # Kelly override when band has ≥10 trades
                     wr = bankroll.band_win_rate(conf_band)
                     if wr is not None:
-                        bet_amount = optimal_bet(wr, bid_price, MAKER_BET_SIZE, MAKER_MAX_BET, MAKER_TARGET_EV)
-                        console.print(f"  [dim]{coin}: Kelly bet ${bet_amount:.2f} (band={conf_band} wr={wr:.0%})[/dim]")
+                        bet_amount = optimal_bet(wr, bid_price, base_bet, MAKER_MAX_BET, MAKER_TARGET_EV)
+                        console.print(f"  [dim]{coin}: Kelly bet ${bet_amount:.2f} (band={conf_band} wr={wr:.0%} base=${base_bet:.2f})[/dim]")
                     else:
-                        bet_amount = MAKER_BET_SIZE
+                        bet_amount = base_bet
 
                     # Discover the market
                     market = discover_market(coin)

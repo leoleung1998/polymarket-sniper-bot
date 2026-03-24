@@ -179,12 +179,75 @@ Trades 15-minute BTC/ETH/SOL "Up or Down" markets using a maker (limit order) st
 - Stops at T-60s before close (last order left to stand)
 - Ceiling is never violated — protects edge regardless of orderbook movement
 
-**Auto-redemption:**
-- Winning positions (resolved YES/NO) become CTF tokens locked in the Gnosis Safe proxy wallet
-- Before each bet, the bot calls `check_and_redeem()` which fires a **background thread** — no trading delay
-- Background thread waits 120s for oracle settlement, then calls `safe.execTransaction(CTF.redeemPositions(...))` on-chain using ~0.04 POL per redemption
-- Falls back to Polymarket gasless relay if EOA has no POL
-- Errors are caught + sent to Telegram — redemption failure never blocks trading
+**Auto-redemption (`redeemer.py`):**
+
+Winning positions on Polymarket are CTF (Conditional Token Framework) tokens held in the Gnosis Safe proxy wallet. They don't auto-convert to USDC — they must be explicitly redeemed on-chain. This is non-trivial because:
+
+- The **FUNDER** wallet (`0x438B...`) is a Gnosis Safe, not a regular EOA
+- The **WALLET_ADDRESS** (`0x084A...`) is the EOA that *owns* the Safe
+- Redemption requires calling `CTF.redeemPositions()` *through* the Safe via `Safe.execTransaction()`
+- The EOA signs the Safe transaction and pays POL gas (~0.04 POL per redemption)
+
+**Call chain:**
+```
+EOA (signs) → Safe.execTransaction(to=CTF, data=redeemPositions(...))
+                └─ CTF.redeemPositions(USDC, bytes32(0), conditionId, [1,2])
+                      └─ USDC lands back in the Safe (FUNDER wallet)
+```
+
+**`redeemPositions` parameters:**
+```python
+CTF.redeemPositions(
+    collateralToken    = USDC_ADDRESS,          # 0x2791Bca...
+    parentCollectionId = bytes32(0),            # always zero for top-level markets
+    conditionId        = bytes32(conditionId),  # from Polymarket position data
+    indexSets          = [1, 2],                # [0b01, 0b10] = both YES and NO slots
+)
+```
+
+**Safe signature packing (`SIGNATURE_TYPE=2`):**
+
+Gnosis Safe requires a specific 65-byte signature format. The EOA signs the Safe transaction hash (not the raw tx hash), then the `v` byte is adjusted:
+```python
+# v adjustment for Gnosis Safe contract signatures
+if v in (0, 1):  v += 31   # → 31 or 32
+if v in (27, 28): v += 4   # → 31 or 32
+packed = r (32 bytes) + s (32 bytes) + v (1 byte)
+```
+
+**Non-blocking design:**
+
+`check_and_redeem()` is called before each bet but returns instantly:
+1. Collects any USDC redeemed by a previous background thread (`pop_redeemed()`)
+2. If new winning positions exist and no thread is running, starts a new daemon thread
+3. The daemon waits 120s (oracle settlement buffer), then redeems sequentially
+
+```
+Main loop ──► check_and_redeem() ──► returns $X from last thread (adds to bankroll)
+                    │
+                    └──► [background daemon thread]
+                              wait 120s
+                              fetch POL balance
+                              if POL >= 0.005 → on-chain via Safe.execTransaction
+                              else            → gasless relay (polymarket relayer-v2)
+                              store result in _pending_redeemed
+                              send Telegram alert
+```
+
+**Two execution paths:**
+
+| Path | Trigger | Gas | Speed |
+|------|---------|-----|-------|
+| On-chain | EOA POL ≥ 0.005 | ~0.04 POL/tx | ~30s |
+| Relay | POL < 0.005 | Free (gasless) | ~60s, shared quota |
+
+EOA currently holds ~111 POL (~2,900 redemptions worth). On-chain path is preferred.
+
+**Fail-safe guarantees:**
+- All errors caught + sent to Telegram — redemption never raises or blocks trading
+- `_redeemed_this_session` set prevents double-redemption within a session
+- Only one background thread runs at a time (checked before starting new one)
+- Position must have `curPrice >= 0.99` and `currentValue >= $0.50` to qualify
 
 **Persistent session state:**
 - W/L counts, balance, and per-band win rates are saved to `data/maker_state.json` after every trade
@@ -244,8 +307,9 @@ All settings are in `.env`. Defaults work out of the box — only `PRIVATE_KEY` 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAKER_COINS` | `BTC,ETH,SOL` | Coins to trade (comma-separated) |
-| `MAKER_BET_SIZE` | `30` | Default bet per trade (USDC) |
-| `MAKER_MAX_BET` | `40.0` | Max bet per trade (USDC) |
+| `MAKER_BET_SIZE` | `30` | Min bet floor (USDC) — also used as fixed size when `MAKER_BET_PCT=0` |
+| `MAKER_MAX_BET` | `40.0` | Max bet ceiling (USDC) — Kelly and fractional bets never exceed this |
+| `MAKER_BET_PCT` | `0.0` | Fractional bankroll sizing: `0.05` = bet 5% of current balance per trade. `0` = use fixed `MAKER_BET_SIZE` |
 | `MAKER_DAILY_BANKROLL` | `100.0` | Daily budget (USDC) |
 | `MAKER_DAILY_LOSS_LIMIT` | `80.0` | Stop trading after this much in losses |
 | `MAKER_MIN_MOVE_PCT` | `0.10` | Min price move to bet (0.1%) |
@@ -488,7 +552,34 @@ bet  = 2.0 / 0.059 ≈ $33.90
 - `2.0` → default — balanced risk/reward
 - `5.0` → larger bets when edge is confirmed (high win rate bands)
 
-Note: bet is always clamped to `[MAKER_BET_SIZE, MAKER_MAX_BET]`, so Kelly only matters once the band has ≥10 trades.
+Note: bet is always clamped to `[base_bet, MAKER_MAX_BET]`, so Kelly only matters once the band has ≥10 trades.
+
+---
+
+### 4b. Fractional Bankroll Sizing (`MAKER_BET_PCT`)
+
+An alternative to fixed bet sizing. Set `MAKER_BET_PCT=0.05` to bet 5% of your current balance each trade:
+
+```
+base_bet = balance × MAKER_BET_PCT
+base_bet = clamp(base_bet, MAKER_BET_SIZE, MAKER_MAX_BET)
+```
+
+**Why use it:**
+- Bets scale up automatically as you win (compounding)
+- Bets shrink automatically after losses (anti-ruin)
+- `MAKER_BET_SIZE` becomes a floor (never bet less), `MAKER_MAX_BET` stays the ceiling
+
+**Example with `MAKER_BET_PCT=0.05`, `MAKER_BET_SIZE=20`, `MAKER_MAX_BET=50`:**
+
+| Balance | Raw 5% | Actual bet |
+|---------|--------|-----------|
+| $300 | $15 | $20 (floor) |
+| $500 | $25 | $25 |
+| $800 | $40 | $40 |
+| $1,200 | $60 | $50 (ceiling) |
+
+Kelly still applies on top of `base_bet` once bands have ≥10 trades. If `MAKER_BET_PCT=0` (default), fixed `MAKER_BET_SIZE` is used unchanged.
 
 ---
 
