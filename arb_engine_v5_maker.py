@@ -44,6 +44,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.text import Text
 
 from binance_feed import feed, connect_binance, get_initial_prices, SYMBOLS
 from crypto_markets import (
@@ -128,6 +131,7 @@ MAKER_BID_PRICE_HIGH = float(os.getenv("MAKER_BID_PRICE_HIGH", "0.95"))  # Bid r
 MAKER_ENTRY_SECONDS = int(os.getenv("MAKER_ENTRY_SECONDS", "120"))    # Enter at T-120s (2 min before close)
 MAKER_LOSS_STREAK_LIMIT = int(os.getenv("MAKER_LOSS_STREAK_LIMIT", "3"))
 MAKER_LOSS_COOLDOWN = int(os.getenv("MAKER_LOSS_COOLDOWN", "3600"))    # 1 hour
+MAKER_STATUS_INTERVAL = float(os.getenv("MAKER_STATUS_INTERVAL", "2.0"))  # status refresh (seconds)
 MAKER_TARGET_EV = float(os.getenv("MAKER_TARGET_EV", "2.0"))          # target $EV per trade for Kelly sizing
 MAKER_SIGNAL_SCALE = float(os.getenv("MAKER_SIGNAL_SCALE", "2.0"))    # divisor in binance_prob formula
 MAKER_MIN_GAP = float(os.getenv("MAKER_MIN_GAP", "0.0"))              # min gap to enter (0 = any edge, -0.03 = tolerate 3% lag)
@@ -466,6 +470,50 @@ class MakerBankroll:
             f"Pending: {len(self.pending_orders)}\n"
             f"  Bands: {self.band_stats()}"
         )
+
+
+def build_status_panel(bankroll: "MakerBankroll", coins: list[str]) -> Table:
+    """Build a Rich Table for the Live display — redrawn every second in-place."""
+    table = Table.grid(padding=(0, 1))
+    table.add_column(no_wrap=True)
+
+    # ── Bankroll row ──────────────────────────────────────────────────────
+    pnl = bankroll.pnl
+    pnl_color = "green" if pnl >= 0 else "red"
+    paper_tag = "  [bold yellow]📝 PAPER[/bold yellow]" if PAPER_TRADE else ""
+    table.add_row(
+        f"  [bold]Bankroll:[/bold] ${bankroll.balance:.2f}  "
+        f"[bold]P&L:[/bold] [{pnl_color}]${pnl:+.2f}[/{pnl_color}]  "
+        f"[bold]W/L:[/bold] {bankroll.wins}/{bankroll.losses} ({bankroll.win_rate:.0%})  "
+        f"[bold]Pending:[/bold] {len(bankroll.pending_orders)}"
+        f"{paper_tag}"
+    )
+
+    # ── Bands row ─────────────────────────────────────────────────────────
+    table.add_row(f"  [dim]Bands: {bankroll.band_stats()}[/dim]")
+
+    # ── Poly odds grid ────────────────────────────────────────────────────
+    odds_parts = []
+    for c in coins:
+        up, down = poly_feed.get_market_prices(c)
+        if up and down:
+            up_col   = "green" if up > 0.5 else "red"
+            down_col = "green" if down > 0.5 else "red"
+            odds_parts.append(
+                f"[bold]{c}[/bold] [{up_col}]↑${up:.2f}[/{up_col}] [{down_col}]↓${down:.2f}[/{down_col}]"
+            )
+        else:
+            odds_parts.append(f"[bold]{c}[/bold] [dim](stale)[/dim]")
+
+    table.add_row("  " + "   [dim]|[/dim]   ".join(odds_parts))
+
+    # ── WS stats row ──────────────────────────────────────────────────────
+    src_color = "yellow" if ws_feed._using_fallback else "green"
+    table.add_row(
+        f"  [dim][{src_color}]{ws_feed.stats}[/{src_color}][/dim]"
+    )
+
+    return table
 
 
 # --- Direction Detection ---
@@ -809,14 +857,14 @@ async def run_maker_bot():
     # Wait a moment for WebSocket to connect and receive initial prices
     await asyncio.sleep(3)
 
-    last_status_print = 0.0
-
     # Track windows per coin
     windows: dict[str, WindowState] = {}
     prev_windows: dict[str, WindowState] = {}  # Previous windows awaiting resolution
 
     console.print("[green]Maker bot started. Monitoring 15-min windows...[/green]")
     console.print()
+
+    last_status_print = 0.0
 
     try:
         while True:
@@ -1192,18 +1240,10 @@ async def run_maker_bot():
                     if o not in stale_orders
                 ]
 
-            # Print status every 60s (time-based, not modulo — never misses)
-            if time.time() - last_status_print >= 10:
+            # Print status every 2s
+            if time.time() - last_status_print >= MAKER_STATUS_INTERVAL:
                 last_status_print = time.time()
-                console.print(f"  {bankroll.status_line()}")
-                poly_lines = []
-                for c in MAKER_COINS:
-                    up, down = poly_feed.get_market_prices(c)
-                    if up and down:
-                        poly_lines.append(f"{c} ↑${up:.2f} ↓${down:.2f}")
-                    else:
-                        poly_lines.append(f"{c} (stale)")
-                console.print(f"  [dim]Poly odds: {' | '.join(poly_lines)} ({ws_feed.stats})[/dim]")
+                console.print(build_status_panel(bankroll, MAKER_COINS))
 
             # Fast poll — check every second near window boundaries
             await asyncio.sleep(1)
