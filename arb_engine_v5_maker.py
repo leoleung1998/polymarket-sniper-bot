@@ -133,6 +133,7 @@ PAPER_TRADE = os.getenv("PAPER_TRADE", "false").lower() == "true"     # Simulate
 
 # ── Hot-reload config (watches .env for changes every 15s) ──────────────────
 _ENV_FILE = Path(__file__).parent / ".env"
+_PAPER_ENV_FILE = Path(__file__).parent / ".env.paper"
 _env_mtime: float = 0.0
 
 
@@ -147,12 +148,16 @@ def _reload_config() -> None:
 
     try:
         mtime = _ENV_FILE.stat().st_mtime
+        if _PAPER_ENV_FILE.exists():
+            mtime = max(mtime, _PAPER_ENV_FILE.stat().st_mtime)
     except OSError:
         return
     if mtime == _env_mtime:
-        return  # file unchanged — skip
+        return  # files unchanged — skip
 
     load_dotenv(override=True)
+    if PAPER_TRADE and _PAPER_ENV_FILE.exists():
+        load_dotenv(_PAPER_ENV_FILE, override=True)
     _env_mtime = mtime
 
     prev = dict(
