@@ -1246,7 +1246,7 @@ async def run_maker_bot():
                 console.print(build_status_panel(bankroll, MAKER_COINS))
 
             # Fast poll — check every second near window boundaries
-            await asyncio.sleep(1)
+            await asyncio.sleep(min(MAKER_STATUS_INTERVAL, 1.0))
 
     except KeyboardInterrupt:
         # Cancel all open orders
