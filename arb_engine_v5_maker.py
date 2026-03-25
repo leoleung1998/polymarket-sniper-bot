@@ -50,7 +50,7 @@ from rich.text import Text
 
 from binance_feed import feed, connect_binance, get_initial_prices, SYMBOLS
 from crypto_markets import (
-    discover_market, CryptoMarket, WINDOW_SECONDS,
+    discover_market, discover_market_tokens, CryptoMarket, WINDOW_SECONDS,
     get_current_window_timestamp, get_next_window_timestamp,
 )
 from poly_feed import poly_feed, poll_poly_prices
@@ -769,6 +769,7 @@ class WindowState:
     chasing: bool = False          # actively cancel-replacing to stay at best bid
     last_chase_ts: float = 0.0     # last time we ran a chase cycle
     chase_max_price: float = 0.0   # our bid_price ceiling — never exceed this
+    tokens_registered: bool = False  # WS subscribed to this window's tokens
 
     @property
     def seconds_remaining(self) -> int:
@@ -841,7 +842,7 @@ async def run_maker_bot():
     # Pre-discover all markets so WS has tokens to subscribe to from the start
     console.print("[dim]Discovering active markets for WS subscription...[/dim]")
     for _coin in MAKER_COINS:
-        _market = discover_market(_coin)
+        _market = discover_market_tokens(_coin)
         if _market:
             ws_feed.register_tokens(_coin, _market.up_token_id, _market.down_token_id)
             console.print(f"[dim]  {_coin}: registered {_market.question}[/dim]")
@@ -849,6 +850,24 @@ async def run_maker_bot():
     # Start Polymarket WS price feed (replaces REST poll — real-time push)
     poly_task = asyncio.create_task(ws_feed.run(MAKER_COINS))
     asyncio.create_task(ws_silence_watchdog(ws_feed, MAKER_COINS))
+
+    # REST heartbeat: refresh prices every 15s regardless of WS state.
+    # Polymarket's WS silently stops routing price events after window transitions
+    # (zombie connection — PING/PONG works but no price_change events delivered)
+    # even when prices are actively moving on the UI. REST poll ensures the display
+    # and entry logic always have fresh prices within the 60s STALE_THRESHOLD.
+    async def _rest_price_heartbeat():
+        while True:
+            await asyncio.sleep(15)
+            for _coin in MAKER_COINS:
+                try:
+                    _m = discover_market(_coin)
+                    if _m:
+                        poly_feed.update(_m.up_token_id,   _coin, "up",   _m.up_price)
+                        poly_feed.update(_m.down_token_id, _coin, "down", _m.down_price)
+                except Exception:
+                    pass
+    asyncio.create_task(_rest_price_heartbeat())
 
     # Hot-reload .env every 15s — no restart needed for config changes
     _start_config_watcher()
@@ -860,6 +879,7 @@ async def run_maker_bot():
     # Track windows per coin
     windows: dict[str, WindowState] = {}
     prev_windows: dict[str, WindowState] = {}  # Previous windows awaiting resolution
+    _last_ws_resub_ts: int = 0  # window timestamp of last WS re-subscription alert
 
     console.print("[green]Maker bot started. Monitoring 15-min windows...[/green]")
     console.print()
@@ -868,6 +888,8 @@ async def run_maker_bot():
 
     try:
         while True:
+            _coins_needing_bootstrap: list[str] = []  # coins that got new tokens this tick
+
             for coin in MAKER_COINS:
                 if coin not in SYMBOLS:
                     continue
@@ -987,6 +1009,31 @@ async def run_maker_bot():
                         f"{max(0, window.seconds_remaining)}s remaining ──[/bold]"
                     )
 
+                    # Register new window tokens with WS — flush happens once after full coin loop.
+                    # Polymarket API may lag a few seconds creating new markets, so we retry
+                    # on each loop tick until discover_market succeeds (tokens_registered flag).
+                    _new_market = discover_market_tokens(coin)
+                    if _new_market:
+                        ws_feed.register_tokens(coin, _new_market.up_token_id, _new_market.down_token_id)
+                        window.tokens_registered = True
+                        _coins_needing_bootstrap.append(coin)
+                        # Send one Telegram alert per window (not per coin)
+                        if current_window_start != _last_ws_resub_ts:
+                            _last_ws_resub_ts = current_window_start
+                            tg.send_message(f"🔄 New window {ts} UTC — WS resubscribed ({len(MAKER_COINS)} coins)")
+
+                # ── Retry WS token registration if discover_market returned None ──
+                # Polymarket API can lag a few seconds creating new window markets.
+                if not window.tokens_registered:
+                    _retry_market = discover_market_tokens(coin)
+                    if _retry_market:
+                        ws_feed.register_tokens(coin, _retry_market.up_token_id, _retry_market.down_token_id)
+                        window.tokens_registered = True
+                        _coins_needing_bootstrap.append(coin)
+                        print(f"[ws] {coin}: retry succeeded — market found, tokens queued for flush")
+                    else:
+                        print(f"[ws] {coin}: waiting for market (API lag — will retry next tick)")
+
                 # ── Check if it's time to enter (T-10 seconds) ──
                 secs_left = window.seconds_remaining
 
@@ -1091,9 +1138,8 @@ async def run_maker_bot():
                         window.order_placed = True
                         continue
 
-                    # Register new tokens with WS feed so it subscribes to this window
+                    # Register new tokens with WS feed — flush happens once after full coin loop
                     ws_feed.register_tokens(coin, market.up_token_id, market.down_token_id)
-                    await ws_feed.flush_pending_tokens()
 
                     if PAPER_TRADE:
                         # Paper trade — simulate the order
@@ -1218,6 +1264,44 @@ async def run_maker_bot():
                     )
                 else:
                     window.chasing = False  # place failed — stop chasing
+
+            # ── Flush all newly registered WS tokens in one batch ──────────────
+            # Must happen AFTER the full coin loop so all coins' tokens go in one
+            # subscribe message. Polymarket WS *replaces* (not adds) subscriptions,
+            # so sending per-coin flushes inside the loop would leave only the last
+            # coin subscribed.
+            #
+            # If new tokens were registered this tick (window boundary), force a WS
+            # reconnect before flushing. Long-lived connections can become zombies:
+            # PING/PONG keeps TCP alive but the server silently stops routing price
+            # events. A fresh connection guarantees a clean subscription.
+            if _coins_needing_bootstrap:
+                await ws_feed.reconnect()
+
+            try:
+                await ws_feed.flush_pending_tokens()
+            except Exception as _e:
+                print(f"[ws] flush_pending_tokens error: {_e}")
+                tg.send_message(f"⚠️ WS flush error: {_e}")
+
+            # ── Alert when retry-based registration completes for all coins ──────
+            _cur_win_ts = get_current_window_timestamp()
+            if _last_ws_resub_ts != _cur_win_ts and windows and all(
+                w.tokens_registered for w in windows.values()
+            ):
+                _last_ws_resub_ts = _cur_win_ts
+                tg.send_message(f"✅ WS resubscribed via retry — all {len(MAKER_COINS)} coins live")
+
+            # ── REST price bootstrap for new-window coins ─────────────────────────
+            # register_tokens() clears old prices immediately. The new market's WS
+            # events can take 30-60s to start (empty book, market makers quoting).
+            # Seed prices from Gamma API so the display never shows (stale).
+            if _coins_needing_bootstrap:
+                for _bc in _coins_needing_bootstrap:
+                    _bm = discover_market(_bc)
+                    if _bm:
+                        poly_feed.update(_bm.up_token_id,   _bc, "up",   _bm.up_price)
+                        poly_feed.update(_bm.down_token_id, _bc, "down", _bm.down_price)
 
             # ── Clean up stale pending orders (older than 20 minutes) ──
             stale_cutoff = time.time() - 1200  # 20 minutes ago

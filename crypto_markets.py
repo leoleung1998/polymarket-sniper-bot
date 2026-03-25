@@ -55,10 +55,12 @@ def get_next_window_timestamp() -> int:
     return get_current_window_timestamp() + WINDOW_SECONDS
 
 
-def discover_market(coin: str) -> CryptoMarket | None:
+def discover_market(coin: str, verbose: bool = False) -> CryptoMarket | None:
     """
     Discover the current active 15-min market for a coin.
     Tries current window first, then next window.
+    Requires market.is_active (accepting_orders + seconds_remaining > 0).
+    Use discover_market_tokens() for WS subscription — does not require is_active.
     """
     prefix = COIN_SLUGS.get(coin)
     if not prefix:
@@ -71,9 +73,34 @@ def discover_market(coin: str) -> CryptoMarket | None:
         market = fetch_market_by_slug(slug, coin)
         if market and market.is_active:
             return market
+        if market and not market.is_active and verbose:
+            print(f"[markets] {coin}: found {slug} but not active "
+                  f"(accepting_orders={market.accepting_orders}, secs_left={market.seconds_remaining})")
 
     # Fallback: search via Gamma API
-    return search_active_market(coin)
+    result = search_active_market(coin)
+    if result is None and verbose:
+        print(f"[markets] {coin}: search_active_market also returned None")
+    return result
+
+
+def discover_market_tokens(coin: str) -> CryptoMarket | None:
+    """
+    Find the current or next window market to get token IDs for WS subscription.
+    Does NOT require is_active — market may be pre-created before accepting orders.
+    Only requires that the market exists and has valid token IDs.
+    """
+    prefix = COIN_SLUGS.get(coin)
+    if not prefix:
+        return None
+
+    for ts in [get_current_window_timestamp(), get_next_window_timestamp()]:
+        slug = f"{prefix}-{ts}"
+        market = fetch_market_by_slug(slug, coin)
+        if market and market.up_token_id and market.down_token_id:
+            return market  # tokens exist — good enough for WS subscription
+
+    return None
 
 
 def fetch_market_by_slug(slug: str, coin: str) -> CryptoMarket | None:

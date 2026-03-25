@@ -13,7 +13,7 @@ import requests
 
 GAMMA_URL = "https://gamma-api.polymarket.com"
 POLL_INTERVAL = 5.0   # seconds between polls
-STALE_THRESHOLD = 30  # seconds before price is considered stale
+STALE_THRESHOLD = 60  # seconds before price is considered stale
 
 
 @dataclass

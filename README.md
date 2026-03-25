@@ -583,13 +583,133 @@ Kelly still applies on top of `base_bet` once bands have ≥10 trades. If `MAKER
 
 ---
 
-### 5. Time-of-Day Signal
+### 5. WebSocket Zombie Connection at Window Boundaries
+
+> **Critical for delta-neutral / 5-min markets:** The same bug occurs at every window boundary. On 5-min markets it fires 3× more often. See [V6_PLAN.md — Infrastructure: WS Zombie at 5-min Frequency](#) for required parameter changes.
+
+---
+
+#### What this bot does (background)
+
+Polymarket creates a brand-new market for each 15-minute window — e.g. `btc-updown-15m-1742900700`. Every market has two tokens: `UP` (BTC closes higher) and `DOWN` (BTC closes lower), each with a unique 256-bit token ID like `0xabc123...`. The bot subscribes to these token IDs on Polymarket's WebSocket and receives live price updates in real time.
+
+#### The bug: all coins show `(stale)` at every window transition
+
+At exactly `HH:00:00`, `HH:15:00`, `HH:30:00`, `HH:45:00`, a new market opens. This requires the bot to:
+1. Discover the new token IDs (new market = new token IDs)
+2. Subscribe the WS to those new tokens
+3. Wait for price events to arrive
+
+**Two problems hit back-to-back at this boundary:**
+
+**Problem A — Price cache cleared with no replacement:**
+
+`register_tokens()` deletes all old-window prices from the in-memory cache immediately (old token IDs are useless once the market resolves). But the WS hasn't received any prices for the new tokens yet. For the next several seconds, `poly_feed.get_price()` returns `None` for every coin → display shows `(stale)`.
+
+```
+T+0s: register_tokens() called → all old prices deleted → (stale) appears
+T+1s: WS subscribe sent to Polymarket server
+T+15s: first price events arrive (market makers haven't quoted yet)
+→ 15 seconds of (stale) on every window transition
+```
+
+**Problem B — Zombie WebSocket connection (the deeper bug):**
+
+Even after the initial gap, prices would freeze permanently after the next transition. Investigation showed:
+
+```
+WS update counter: 555,398 (frozen, never increments again)
+PING/PONG: ✅ working fine
+price_change events: ❌ silently stopped
+Polymarket UI: prices actively moving (market is NOT quiet)
+```
+
+The WS connection stays alive at the TCP level (PING/PONG works), but Polymarket's server **silently stops routing price_change events** for the subscribed tokens. This is a server-side state issue at market boundaries.
+
+This was invisible at first because `_last_msg` (the silence watchdog's timestamp) was being refreshed by PONG messages every 10 seconds — so the watchdog never triggered. The bot had no way to tell "I'm getting PONGs but no price data".
+
+#### What we confirmed through testing
+
+| Test | Result |
+|------|--------|
+| `test_window_lag.py` — does Polymarket API have lag at transition? | **Zero lag** — next-window markets exist with `acceptingOrders=True` 5+ minutes before they open |
+| `test_ws_subscribe.py` — does each subscribe replace or add tokens? | **ADD** (not replace) — each subscribe adds tokens, never drops existing ones |
+| `test_bootstrap.py` — how long does REST bootstrap take? | **~638ms** — well within 1 loop tick |
+| Live observation at `00:30:00` transition | Bootstrap worked (prices jumped from 0/1 resolved → 0.47/0.53 live in <1s), then WS delivered 1,438 events and froze permanently while Polymarket UI showed active price movement |
+
+#### Three-layer fix
+
+**Layer 1 — REST price bootstrap** (fixes the gap at transition):
+
+Immediately after `register_tokens()` clears old prices, fetch fresh prices from the Gamma REST API and seed the cache. The display shows real prices within ~650ms, never `(stale)`.
+
+```python
+# arb_engine_v5_maker.py — after register_tokens()
+for coin in _coins_needing_bootstrap:
+    m = discover_market(coin)
+    if m:
+        poly_feed.update(m.up_token_id,   coin, "up",   m.up_price)
+        poly_feed.update(m.down_token_id, coin, "down", m.down_price)
+```
+
+**Layer 2 — Force WS reconnect at every boundary** (attempts to clear zombie):
+
+Close and reopen the WS connection at each window transition. A fresh connection gets a fresh server-side session with proper event routing.
+
+```python
+# poly_ws.py
+async def reconnect(self):
+    await self._ws.close()       # kill zombie
+    self._pending_tokens = list(self._token_map.keys())  # re-subscribe everything
+# run() loop reconnects automatically
+```
+
+This helps but is not guaranteed — Polymarket's server can go zombie again on the new connection after a few hundred events.
+
+**Layer 3 — REST price heartbeat every 15s** (the definitive fix):
+
+Since the WS is unreliable after window boundaries, poll the Gamma REST API every 15 seconds regardless of WS state. This keeps `poly_feed` prices fresh even when the WS is completely zombie.
+
+```python
+# arb_engine_v5_maker.py — background task
+async def _rest_price_heartbeat():
+    while True:
+        await asyncio.sleep(15)
+        for coin in MAKER_COINS:
+            m = discover_market(coin)
+            if m:
+                poly_feed.update(m.up_token_id,   coin, "up",   m.up_price)
+                poly_feed.update(m.down_token_id, coin, "down", m.down_price)
+asyncio.create_task(_rest_price_heartbeat())
+```
+
+With `STALE_THRESHOLD = 60s` and prices refreshed every 15s, the cache **never expires** — even with a fully zombie WS.
+
+**Layer 4 — Price event lag tracking** (visibility):
+
+`_last_price_event` tracks the last time a `price_change` event was processed (not the last PONG). The status panel shows `price_lag=Xs` when no price events have arrived for > 5s — making zombie connections immediately visible in the display.
+
+#### Summary
+
+| | Before fix | After fix |
+|---|---|---|
+| Window transition gap | ~15–30s stale | <1s (bootstrap fills in ~650ms) |
+| WS zombie | Permanent stale | REST heartbeat keeps prices fresh |
+| `STALE_THRESHOLD` | 30s (too tight) | 60s (headroom for REST poll gaps) |
+| REST heartbeat | None | Every 15s (3 refreshes per STALE window) |
+| Zombie visibility | Invisible | `price_lag=Xs` in status panel |
+
+**The WS is still used when it works** (real-time, low latency). The REST heartbeat is a safety net — it adds ~3 Gamma API calls/min per coin but ensures prices are never stale regardless of WS health.
+
+---
+
+### 6. Time-of-Day Signal
 
 Not currently used. Hypothesis: Polymarket is less efficient at pricing crypto moves during low-liquidity hours (03:00–08:00 UTC) — more edge available. High-liquidity hours (13:00–21:00 UTC, US market hours) → Polymarket prices in moves faster → more skips. Worth adding `hour_of_day` as a feature.
 
 ---
 
-### 6. Data Available for Model Training
+### 7. Data Available for Model Training
 
 All trades are logged to `data/maker_trades.json`:
 ```json

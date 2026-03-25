@@ -38,6 +38,7 @@ class PolyWSFeed:
         self._using_fallback = False
         self._disconnect_alerted = False                  # avoid repeat disconnect spam
         self._update_count = 0
+        self._last_price_event: float = time.time()      # last time a price event was processed
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
@@ -45,7 +46,14 @@ class PolyWSFeed:
         """
         Call when a new 15-min window is discovered.
         Registers token→coin/side mapping and triggers subscription if connected.
+        Clears old resolved prices for this coin so stale 0.00/1.00 don't linger.
         """
+        # Remove old price entries for this coin (resolved window shows 0.00/1.00)
+        stale_ids = [tid for tid, (c, _) in self._token_map.items() if c == coin]
+        for tid in stale_ids:
+            poly_feed._prices.pop(tid, None)
+            del self._token_map[tid]
+
         self._token_map[up_token]   = (coin, "up")
         self._token_map[down_token] = (coin, "down")
         self._pending_tokens.extend([up_token, down_token])
@@ -54,7 +62,10 @@ class PolyWSFeed:
         """Subscribe any tokens registered since last connection."""
         if not self._pending_tokens or not self._connected or self._ws is None:
             return
-        tokens = list(set(self._pending_tokens))
+        # Include ALL known tokens from _token_map so partial retries (where only
+        # some coins succeed per tick) don't replace the full subscription with a
+        # subset. WS subscribe is "replace", so every flush must be complete.
+        tokens = list(set(list(self._token_map.keys()) + self._pending_tokens))
         self._pending_tokens.clear()
         try:
             msg = {
@@ -71,7 +82,25 @@ class PolyWSFeed:
     @property
     def stats(self) -> str:
         src = "REST fallback" if self._using_fallback else "WS"
-        return f"source={src} updates={self._update_count} tokens={len(self._token_map)}"
+        price_lag = int(time.time() - self._last_price_event)
+        lag_str = f" price_lag={price_lag}s" if price_lag > 5 else ""
+        return f"source={src} updates={self._update_count} tokens={len(self._token_map)}{lag_str}"
+
+    async def reconnect(self):
+        """
+        Force-close the current WS connection so the run() loop reconnects fresh.
+        Call at window boundaries to clear zombie connections where PING/PONG works
+        but price event routing has silently died on the server side.
+        """
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+            self._connected = False
+            # All current tokens will be re-subscribed on reconnect via _connect_and_stream
+            self._pending_tokens = list(self._token_map.keys())
 
     # ── Internal ────────────────────────────────────────────────────────────────
 
@@ -147,8 +176,13 @@ class PolyWSFeed:
                     continue
                 try:
                     mid = round((float(bid) + float(ask)) / 2, 4)
+                    silent_for = time.time() - self._last_price_event
                     poly_feed.update(token_id, coin, side, mid)
                     self._update_count += 1
+                    self._last_price_event = time.time()
+                    # Log when price events resume after a silence > 30s
+                    if silent_for > 30:
+                        print(f"[poly_ws] Price events resumed for {coin} after {silent_for:.0f}s silence")
                 except (ValueError, TypeError):
                     pass
 
