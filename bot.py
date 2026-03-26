@@ -221,6 +221,12 @@ def cmd_maker():
     maker_main()
 
 
+def cmd_pairs():
+    """Run v6 delta-neutral pairs bot — Mode B correlated pairs strategy."""
+    from arb_engine_v6_pairs import main as pairs_main
+    pairs_main()
+
+
 def cmd_tp():
     """Run take profit monitor — sells positions when gain > TP_THRESHOLD."""
     from take_profit import main as tp_main
@@ -285,6 +291,7 @@ def main():
         "positions": cmd_positions,
         "bracket": cmd_bracket,
         "maker": cmd_maker,
+        "pairs": cmd_pairs,
         "tp": cmd_tp,
         "dual": cmd_dual,
     }
@@ -299,6 +306,7 @@ def main():
         console.print("  python bot.py run         # Start v3.5 bot (15-min crypto arb, DEPRECATED)")
         console.print("  python bot.py bracket     # Start v5 weather bot (GFS ensemble)")
         console.print("  python bot.py maker       # Start v5 crypto maker (15-min markets)")
+        console.print("  python bot.py pairs       # Start v6 delta-neutral pairs bot (Mode B)")
         console.print("  python bot.py tp          # Run take profit monitor")
         console.print("  python bot.py dual        # Run weather + crypto maker + TP in parallel")
         console.print("  python bot.py positions   # Show positions and P&L")

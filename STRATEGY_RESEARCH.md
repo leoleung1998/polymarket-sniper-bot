@@ -507,3 +507,290 @@ Proxy:           Rotating residential proxy (Cloudflare blocks many IPs)
 ---
 
 *Research compiled March 2026. Markets evolve rapidly -- strategies that work today may be arbitraged away tomorrow.*
+
+---
+
+## QUANT RESEARCH NOTES — Session March 2026
+
+> Deep-dive notes from building and extending the v6 pairs bot. Covers pairs trading math, lead-lag, OFA, perp L/S construction, and model validation framework.
+
+---
+
+### Delta-Neutral Pairs Trading (Polymarket v6)
+
+**What we built vs classic pairs trading:**
+
+| | Our Polymarket bot | Classic pairs trading |
+|---|---|---|
+| Bet | Both coins move SAME direction | Spread CONVERGES to mean |
+| Legs | Long A_up + Long B_down (same direction) | Long underperformer + Short outperformer |
+| Edge source | Sum < $1.00 (structural mispricing) | Z-score deviation from historical mean |
+| Exit | Binary resolution at window close | When spread reverts |
+| Correlation role | Entry filter (ρ > sum) | Hedge ratio calculator |
+| P&L | Binary $0 or $1/share | Continuous mark-to-market |
+
+**Core math:**
+```
+sum_1 = price_a_up + price_b_down   # scenario: A up, B down
+sum_2 = price_a_down + price_b_up   # scenario: A down, B up
+best_sum = min(sum_1, sum_2)         # always take cheaper direction
+edge     = 1 - best_sum
+
+EV = ρ×(1-sum) - (1-ρ)×sum
+Break-even identity: EV=0 exactly when ρ=sum
+
+→ sum=0.86 needs ρ > 0.86 to profit
+→ sum=0.78 needs ρ > 0.78 to profit
+→ flat MIN_RHO=0.80 is WRONG for sum=0.86 (negative EV at ρ=0.82)
+```
+
+**Proper Kelly for pairs:**
+```
+b = (1-sum)/sum               # net win per unit stake
+f* = (ρ×b - (1-ρ)) / b       # full Kelly
+quarter-Kelly = f* × 0.25 × balance
+
+Example: ρ=0.95, sum=0.86, $100 balance
+  b = 0.14/0.86 = 0.163
+  f* = (0.95×0.163 - 0.05) / 0.163 = 64.3%
+  quarter-Kelly spend = 0.25 × 0.643 × $100 = $16.07
+```
+
+**EV is correlation-invariant but variance is not:**
+```
+Lower ρ → more jackpot wins AND more total losses → higher variance, same EV
+What kills EV is sum rising above break-even (fees), not correlation dropping.
+```
+
+---
+
+### EWMA-Weighted Pearson Correlation
+
+**Why over simple Pearson:**
+- Equal-weight treats candle from 100min ago same as 5min ago
+- EWMA detects correlation regime changes in 2-3 candles vs 10+
+- Half-life at λ=0.90: recent candle weighs ~10× more than oldest
+
+**Formula:**
+```python
+weights = [λ^(n-1-i) for i in range(n)]   # oldest → newest
+w_sum = sum(weights)
+mx = Σ(w_i × x_i) / w_sum
+cov  = Σ w_i(x_i - mx)(y_i - my)
+ρ    = cov / sqrt(var_x × var_y)
+β    = cov / var_y    # hedge ratio (notional, not base qty — see below)
+```
+
+**Tuning (PAIRS_EWMA_DECAY in .env):**
+| λ | Half-life (5-min) | Half-life (15-min) | Character |
+|---|---|---|---|
+| 0.85 | 4 candles (20 min) | 4 candles (1h) | Very reactive, noisy |
+| 0.90 | 6 candles (30 min) | 6 candles (1.5h) | Balanced (default) |
+| 0.94 | 11 candles (55 min) | 11 candles (2.75h) | Smooth, slow to react |
+
+---
+
+### Perp Long/Short Construction
+
+**Spread construction:**
+```
+spread_t = log(BTC_t) - β × log(ETH_t)
+β = Cov(r_BTC, r_ETH) / Var(r_ETH)
+```
+
+**β is in NOTIONAL terms, not base quantity:**
+```
+β=0.70 means: short $700 ETH per $1,000 BTC long
+NOT: short 0.70 ETH per 1 BTC (would be ~2× overhedged)
+
+In base qty:
+  btc_qty = notional / btc_price
+  eth_qty = (notional × β) / eth_price
+
+Base qty ratio drifts as prices move. Always store β as notional, convert at order time.
+```
+
+**Z-score entry:**
+```
+z = (spread_t - mean_spread) / std_spread
+z > +2  →  BTC expensive vs ETH  →  SHORT BTC, LONG ETH
+z < -2  →  ETH expensive vs BTC  →  LONG BTC, SHORT ETH
+exit: |z| < 0.5  |  stop: |z| > 4.0
+```
+
+**Why basic z-score model struggles:**
+1. BTC/ETH spread doesn't mean-revert — regime shifts are permanent
+2. Extremely crowded (every quant fund runs it)
+3. Funding rates (0.03-0.1%/8h) eat the ~0.3% edge
+4. Need: ADF cointegration test, regime filter, less crowded pairs
+
+---
+
+### Lead-Lag and Cross-Exchange Arbitrage
+
+**Information flow hierarchy in crypto:**
+```
+Binance BTC spot → Binance BTC perp → ETH perp → SOL → smaller alts
+     ~0ms              ~50ms            ~100ms    ~200ms
+```
+
+**Retail-viable approach — limit-limit (not market-market):**
+```
+Naive arb (you lose to HFT):
+  See Binance tick up → market order OKX → already done
+
+Lead-lag limit (speed-tolerant):
+  Detect Binance order flow bullish
+  → place limit BUY on OKX at current ask BEFORE it reprices
+  → Binance ticks up 2s later, OKX reprices
+  → your limit fills at the old (better) price
+```
+
+**Detecting lead-lag dynamically:**
+
+1. **Cross-correlation function (CCF):**
+```python
+# Peak lag where correlation is highest = lead time in ms
+# Positive peak = A leads B, negative = B leads A
+```
+
+2. **Granger causality:**
+```python
+from statsmodels.tsa.stattools import grangercausalitytests
+# p < 0.05 at lag L = A Granger-causes B with L-period lead
+```
+
+3. **Hasbrouck Information Share:**
+```
+# Fraction of price discovery at each venue
+# IS > 0.5 = that venue leads price discovery
+# Requires VAR model on mid-price series
+```
+
+**Alpha decay measurement:**
+```python
+for horizon in [1, 2, 5, 10, 30, 60, 120]:  # seconds
+    IC = corr(signal_at_t, return_at_{t+horizon})
+    # IC half-life = optimal hold time
+    # Typical BTC/ETH cross-exchange: decay at 30-60s
+```
+
+**Latency window by execution speed:**
+| Lag duration | Who can trade it |
+|---|---|
+| < 10ms | Co-located HFT only |
+| 10ms-100ms | HFT with good infra |
+| 100ms-1s | Fast algo (cloud) |
+| 1s-60s | Retail algo with fast API |
+| > 60s | Anyone — edge smaller |
+
+---
+
+### Order Flow Alpha (OFA)
+
+**Core concept:** Aggressive market orders reveal private information before price moves.
+
+```
+OFI = aggressive_buy_volume - aggressive_sell_volume
+OFI > 0 → buying pressure → price ticks up soon
+
+Aggressive BUY  = market order hitting the ask (buyer is urgent)
+Aggressive SELL = market order hitting the bid (seller is urgent)
+```
+
+**Three levels:**
+1. **Basic OFI:** count buy/sell volume in rolling window
+2. **Orderbook OFI (Stoikov 2021):** watch bid/ask qty changes tick by tick
+3. **Multi-level OFI:** full 10-level depth, each weighted
+
+**Why better than price signals:**
+```
+OFI IC at 1s horizon:          0.15-0.30
+Price momentum IC at 1s:       0.03-0.08
+→ 3-5× more predictive at sub-minute
+```
+
+**Binance data source — free, real-time:**
+```python
+# aggTrade WebSocket stream
+# m=False → aggressive BUY  (buyer hit ask)
+# m=True  → aggressive SELL (seller hit bid)
+```
+
+**What v5 maker already does:** price move % as proxy for cumulative OFI.
+Real OFI replaces it with aggTrade stream — more signal, less lag.
+
+---
+
+### Model Validation Framework
+
+**Statistical tests (in priority order):**
+
+1. **T-test on returns** — is mean return significantly > 0?
+   - Need: p < 0.05, t > 2.0, n > 100 trades minimum
+
+2. **Out-of-sample test** — most important
+   - IS: develop + tune | OOS: final test, never touch during development
+   - OOS Sharpe < 50% of IS Sharpe → overfit
+
+3. **Permutation test** — destroys signal, checks if results are luck
+   - Shuffle returns 10,000 times
+   - Real Sharpe > 95th percentile of shuffled → edge is real
+
+4. **Walk-forward validation** — roll the IS/OOS window forward
+   - Concatenate all OOS periods → real out-of-sample performance curve
+
+**Key metrics:**
+| Metric | Minimum | Good | Excellent |
+|--------|---------|------|-----------|
+| Sharpe (annualised) | >1.0 | >2.0 | >3.0 |
+| Max drawdown | <20% | <10% | <5% |
+| Profit factor | >1.2 | >1.5 | >2.0 |
+| Information Ratio (OOS) | >0.5 | >1.0 | >2.0 |
+
+**Attribution analysis:**
+- Break P&L by regime (volatility, time of day, signal strength)
+- IC decay curve on live trades (where does the signal actually work?)
+- Fee attribution (gross - fees - funding = how much survives?)
+
+**Red flags:**
+```
+OOS Sharpe < 50% of IS        → overfit, simplify model
+All alpha in 3-5 trades        → luck not system, remove outliers and retest
+Gross positive, net negative   → fees eating edge, raise selectivity
+P&L flat after initial period  → regime change, model needs retraining
+Win rate high, profit factor <1.2 → cutting winners early / letting losers run
+```
+
+**The summary number:**
+```
+Information Ratio (OOS) > 0.5 on 6+ months clean OOS data
++ permutation p-value < 0.01
+= model worth deploying with real capital
+```
+
+---
+
+### Reusable Components for Perp L/S Strategy
+
+Everything in `arb_engine_v6_pairs.py` that can be directly reused:
+
+| Component | Reuse for perp L/S |
+|---|---|
+| `CandleTracker._returns` | Same returns series, plug into CCF |
+| `_ewma_pearson` | Extend to `_ewma_beta_and_rho` — returns (β, ρ) together |
+| `bootstrap_candle_history` | Same Binance REST kline fetch |
+| `binance_feed` | Already streaming, add `aggTrade` for OFI |
+| `EWMA_DECAY` config | Same decay parameter |
+
+New pieces needed:
+```
+1. OKX/Bybit WebSocket feed   (parallel to binance_feed.py)
+2. Spread series tracker       (log(BTC) - β×log(ETH) per window)
+3. Z-score calculator          (rolling mean + std of spread)
+4. cross_correlation_lags()    (pure numpy, CCF for dynamic lead detection)
+5. alpha_decay_curve()         (run offline on historical data first)
+6. Limit order on laggard      (exchange connector — CCXT or direct)
+7. Funding rate monitor        (cost that erodes edge, check every 8h)
+8. Mark-to-market exit         (continuous P&L vs binary resolution)
+```

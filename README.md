@@ -11,12 +11,13 @@ Automated trading bot for Polymarket prediction markets. Three strategies, one c
 | **+ Cloud Deployment** | Bot runs 24/7 even when your laptop is closed | +20 minutes |
 | **+ AI Control Bot** | Message your bot from your phone, Claude AI diagnoses issues and makes fixes | +5 minutes |
 
-## The Four Strategies
+## The Five Strategies
 
 1. **Weather Bracket Bot** — Trades daily weather temperature brackets using the GFS 31-member ensemble forecast. Counts how many ensemble members land in each bracket to compute probability. Buys when edge > 8%.
 2. **Crypto Maker Bot** — Trades 15-min BTC/ETH/SOL up/down markets. Enters aggressively at best bid + 1 tick (capped at our price ceiling), chases fills every 30s by cancel-replacing, filtered by Allium on-chain smart money signals. Auto-redeems winning CTF tokens in background before each bet cycle. Running at **88% win rate**.
-3. **Sniper** — Buys outcomes priced under 3 cents. High volume, low cost, lottery-ticket math.
-4. **Sniper + Take Profit** — Same as Sniper, but automatically sells positions when gain exceeds TP_THRESHOLD (default +40%). Monitors open positions every 60 seconds and places aggressive GTC sell orders N basis points below the real best ask.
+3. **Delta-Neutral Pairs Bot (v6)** — Trades correlated crypto pairs (BTC/ETH) on 5-min or 15-min up/down markets. Buys both legs simultaneously when their combined price is below 1.0. Wins whether both go UP or both go DOWN (~95% of windows). Loses only on genuine divergence (~5%). Completely direction-agnostic. Entry confirmed by Binance rolling correlation on **completed candles only**.
+4. **Sniper** — Buys outcomes priced under 3 cents. High volume, low cost, lottery-ticket math.
+5. **Sniper + Take Profit** — Same as Sniper, but automatically sells positions when gain exceeds TP_THRESHOLD (default +40%). Monitors open positions every 60 seconds and places aggressive GTC sell orders N basis points below the real best ask.
 
 ---
 
@@ -52,7 +53,8 @@ Polymarket blocks US IPs. Connect [ProtonVPN](https://pr.tn/ref/WMF7NFH4) (or an
 # Pick your strategy:
 python bot.py bracket     # Weather bot (recommended to start)
 python bot.py maker       # Crypto maker (15-min BTC/ETH/SOL)
-python bot.py dual        # Both in parallel
+python bot.py pairs       # Delta-neutral pairs bot v6 (BTC/ETH correlated)
+python bot.py dual        # Both weather + crypto maker in parallel
 python bot.py tp          # Sniper + Take Profit (buy cheap, sell at +40%)
 
 # Utilities:
@@ -257,6 +259,41 @@ EOA currently holds ~111 POL (~2,900 redemptions worth). On-chain path is prefer
 
 **Why it works:** 8-minute entry + aggressive chasing means high fill rates while Allium smart money filter blocks bad calls. Break-even bid prices (0.82/0.88) give realistic margins vs win rate. Running at **88% win rate** since adding the Allium filter. Maker orders = zero fees + maker rebates.
 
+### Delta-Neutral Pairs Bot (`python bot.py pairs`)
+
+Trades correlated crypto pairs on Polymarket's 5-min or 15-min up/down markets. Works by buying both sides of a correlated pair simultaneously — direction doesn't matter.
+
+**The edge:** BTC and ETH move the same direction ~95% of windows. When Polymarket prices them independently, the combined cost of buying both correlation outcomes is sometimes below $1.00 — i.e. `BTC_UP + ETH_DOWN < 1.00`. You collect that discount whether BTC and ETH both go up (BTC_UP wins) or both go down (ETH_DOWN wins). You only lose if they genuinely diverge, which historically happens ~5% of the time.
+
+**Flow:**
+1. Connects to Binance WebSocket for real-time prices + bootstraps 20 completed candles at startup
+2. Every tick: computes `sum_1 = BTC_UP + ETH_DOWN` and `sum_2 = BTC_DOWN + ETH_UP`
+3. Takes the cheaper direction: `best_sum = min(sum_1, sum_2)`
+4. Checks Binance **completed candle** Pearson ρ — if correlation is low, skip (it's real divergence, not mispricing)
+5. Entry guard: `ρ > best_sum` (exact break-even identity — flat MIN_RHO is wrong, see §8)
+6. Places aggressive GTC at ask price (effective taker), both legs sized by equal shares
+7. Holds to resolution — one leg pays $1.00/share, the other pays $0
+8. Resolution checked 30s after window close; P&L logged to `data/pairs/`
+
+**Status panel shows:**
+- Per-coin live UP/DOWN prices with stale detection
+- Rolling Binance ρ (completed candles) with candle count
+- Both directional sums for every pair + best edge
+- Active signals, open positions, bankroll
+
+**Telegram alerts:**
+- New window notification at every boundary (with pair names and fresh token subscription confirmation)
+- Trade entry, outcome (WIN_BOTH / WIN_A / WIN_B / LOSS)
+
+**The forming candle trap (hard lesson from live testing):**
+
+A live test showed BTC and ETH both mid-candle showing green (same direction) with sum=0.69 — looked like a perfect entry. Both legs lost. Reason: the *forming* candle hadn't closed yet. ETH reversed before the 15-minute window closed. The fix: `CandleTracker` only uses **closed candles** (`klines[:-1]` from Binance REST). Never the current open candle.
+
+**Why 5-min delivers 3× more trades:**
+Same infrastructure, same edge per trade, 288 windows/day vs 96. Set `PAIRS_MARKET_WINDOW=5` in `.env`. See §9 for full WS reconfiguration requirements at 5-min frequency.
+
+---
+
 ### Sniper Mode (`python bot.py scan` / `run`)
 
 Scans all active Polymarket events for outcomes priced under 3 cents. Places small bets on extreme long shots with asymmetric upside.
@@ -350,6 +387,7 @@ All settings are in `.env`. Defaults work out of the box — only `PRIVATE_KEY` 
 |---------|-------------|
 | `python bot.py bracket` | Weather bracket bot (GFS ensemble) |
 | `python bot.py maker` | Crypto maker bot (15-min BTC/ETH/SOL) |
+| `python bot.py pairs` | Delta-neutral pairs bot v6 (BTC/ETH correlated, 5-min or 15-min) |
 | `python bot.py dual` | Run weather + crypto maker in parallel |
 | `python bot.py tp` | Sniper + Take Profit (buy cheap, sell at +40%) |
 | `python bot.py tp test` | Test full buy→sell cycle with $5 |
@@ -374,10 +412,13 @@ polymarket-sniper-bot/
 │
 ├── # ── Crypto Maker Bot ──
 ├── arb_engine_v5_maker.py  # 15-min crypto maker strategy (chase + auto-redeem)
-├── crypto_markets.py       # 15-min up/down market discovery
+├── crypto_markets.py       # 15-min up/down market discovery (shared by maker + pairs)
 ├── binance_feed.py         # Real-time BTC/ETH/SOL prices (WebSocket)
 ├── poly_feed.py            # Polymarket odds feed (polls every 5s)
 ├── redeemer.py             # Auto-redeems winning CTF tokens via Safe.execTransaction
+│
+├── # ── Delta-Neutral Pairs Bot v6 ──
+├── arb_engine_v6_pairs.py  # Correlated pairs strategy (Mode B delta-neutral)
 │
 ├── # ── Remote Control (Level 4) ──
 ├── telegram_control.py     # Claude AI Telegram bot (control from phone)
@@ -399,25 +440,32 @@ polymarket-sniper-bot/
     ├── tp_log.json         # Take profit sell history
     ├── maker_trades.json   # Maker bot fill history
     ├── maker_pending.json  # Live pending orders (used by kill switch)
-    └── maker_state.json    # Persistent W/L + band win rates (survives restarts)
+    ├── maker_state.json    # Persistent W/L + band win rates (survives restarts)
+    └── pairs/              # Pairs bot v6 state
+        ├── pairs_state.json    # Balance, W/L, band wins (survives restarts)
+        └── pairs_trades.jsonl  # All pairs trade entries and outcomes (JSONL)
 ```
 
 ## Safety Features
 
-| Guard | Weather Bot | Crypto Maker |
-|-------|------------|--------------|
-| Daily bankroll cap | $50 | $100 |
-| Daily loss limit | — | $80 |
-| Max drawdown | 35% (circuit breaker) | — |
-| Loss streak pause | 5 losses → 30 min | 3 losses → 60 min |
-| Win rate floor | Halts if <30% after 10 trades | — |
-| Model sanity check | Skip if model vs market >40% apart | Skip if <0.1% price move |
-| Smart money filter | — | Skip if Allium whales contradict direction |
-| Bid price auto-cap | — | Caps bid at `observed_win_rate - 5%` per confidence band (≥10 trades) |
-| Chase ceiling | — | Never exceeds `bid_price` regardless of orderbook |
-| Redemption failure | — | Caught + Telegram alert, trading continues |
-| State file corruption | — | Discards + starts fresh, logs warning |
-| Telegram alerts | Every trade/win/loss/halt | Every trade/win/loss/halt/redeem |
+| Guard | Weather Bot | Crypto Maker | Pairs Bot v6 |
+|-------|------------|--------------|--------------|
+| Daily bankroll cap | $50 | $100 | Configurable (`PAIRS_BANKROLL`) |
+| Daily loss limit | — | $80 | $30 (`PAIRS_DAILY_LOSS_LIMIT`) |
+| Max drawdown | 35% (circuit breaker) | — | — |
+| Loss streak pause | 5 losses → 30 min | 3 losses → 60 min | — |
+| Win rate floor | Halts if <30% after 10 trades | — | — |
+| Model sanity check | Skip if model vs market >40% apart | Skip if <0.1% price move | Skip if ρ ≤ sum (EV guard) |
+| Smart money filter | — | Skip if Allium whales contradict direction | — |
+| Bid price auto-cap | — | Caps bid at `observed_win_rate - 5%` per band (≥10 trades) | Kelly switches to observed band WR after 10 trades per band |
+| Chase ceiling | — | Never exceeds `bid_price` regardless of orderbook | N/A (taker, fills immediately) |
+| Orphan leg protection | — | — | Cancels filled leg if partner fails within 5s |
+| Leg price range | — | — | Skip if leg < 0.15 or > 0.85 (near-resolved) |
+| Minimum time guard | — | — | Skip if window < 300s remaining |
+| Forming candle guard | — | — | ρ computed on **closed candles only** (never forming) |
+| Redemption failure | — | Caught + Telegram alert, trading continues | N/A (CTF payout auto at resolution) |
+| State file corruption | — | Discards + starts fresh | Discards + starts fresh |
+| Telegram alerts | Every trade/win/loss/halt | Every trade/win/loss/halt/redeem | New window, every trade, outcome |
 
 ---
 
@@ -727,6 +775,239 @@ All trades are logged to `data/maker_trades.json`:
 Outcome records (`type: "maker_outcome"`) include win/loss. Join on timestamp to get full feature set. Target variable: `outcome == "win"`. Features available: `coin`, `direction`, `bid_price`, `move_pct` (from log), `poly_price` (from log), `time_of_day`, `conf_band`.
 
 Currently ~10 trades. Need 200+ per band for statistically significant model fitting.
+
+---
+
+### 8. Delta-Neutral Pairs — Full Quant Model (v6 Mode B)
+
+This section documents the complete mathematical framework for Mode B pairs trading. Intended as a quant reference for calibration, scaling, and building the 5-min version.
+
+#### Always take the cheaper direction
+
+For any pair (A, B), compute both directional combos every tick and enter the one with the lower sum:
+
+```python
+sum_1 = price_a_up   + price_b_down   # buy A_up + B_down
+sum_2 = price_a_down + price_b_up     # buy A_down + B_up
+best_sum = min(sum_1, sum_2)          # always enter the cheaper side
+```
+
+The direction flips depending on which coin is leading at any moment. Never hardcode it.
+
+```
+Tick 1:  BTC UP=0.55  ETH DOWN=0.31  →  sum_1=0.86  sum_2=1.14  →  enter sum_1
+Tick 2:  BTC UP=0.77  ETH DOWN=0.54  →  sum_1=1.31  sum_2=0.69  →  enter sum_2
+```
+
+Entering the wrong direction means paying 5–15% more for the same payout.
+
+#### Why equal shares, not equal dollars
+
+Each leg pays **$1 per share** if it wins. Sizing by equal shares means both legs deliver the same payout — the hedge is symmetric. Sizing by equal dollars distorts it: if BTC DOWN = 0.23 and ETH UP = 0.46, equal dollars would buy 2× more BTC DOWN shares, making the trade a net directional bet on BTC falling.
+
+```
+Leg A: buy N shares of BTC DOWN at 0.23  →  cost = 0.23N
+Leg B: buy N shares of ETH UP   at 0.46  →  cost = 0.46N
+Total spend = 0.69N  (the "sum")
+```
+
+#### EV formula
+
+```
+P(same direction) = ρ   (correlation — ~0.95 for BTC/ETH)
+P(diverge)        = 1 - ρ
+
+EV = ρ    × (N - 0.86N)    +    (1-ρ)/2 × (2N - 0.86N)    +    (1-ρ)/2 × (0 - 0.86N)
+   = ρ    × 0.14N          +    (1-ρ)/2 × 1.14N            -    (1-ρ)/2 × 0.86N
+   = 0.14N   (EV is constant regardless of ρ — see below)
+
+ROI on capital = 0.14N / 0.86N = 16.3%
+ROI after 5% fees = (N - 0.903N) / 0.903N = 10.7%
+```
+
+**Key insight: EV is correlation-invariant.** Lower ρ shifts probability mass from "win one leg" to "win both" and "lose both", but EV stays constant. What changes is *variance* — lower ρ → wilder swings. This is why ρ drives bet *sizing* (Kelly), not the entry decision itself.
+
+**However EV is NOT profit-invariant.** The break-even condition is exactly:
+
+```
+EV = ρ×(1-sum) - (1-ρ)×sum = 0
+→ ρ = sum  (exact mathematical identity)
+
+sum=0.86 → need ρ > 0.86 to profit
+sum=0.78 → need ρ > 0.78 to profit
+sum=0.90 → need ρ > 0.90 to profit
+```
+
+This is the most important rule in the model: **the minimum viable ρ is not fixed — it equals the sum you're entering at.** A flat `MIN_RHO=0.80` is wrong for sum=0.86 (negative EV). The EV guard `ρ > sum` is mandatory on every entry.
+
+#### Variance and risk model
+
+```
+Variance per trade (N shares, sum=s, correlation=ρ):
+
+  σ² = ρ(1-ρ) × N²(1-s)²  +  (1-ρ)/2 × N²(2-s)²  +  (1-ρ)/2 × N²s²
+     ≈ (1-ρ) × N²           (dominant term at low ρ)
+
+Standard deviation of outcome ∝ sqrt(1-ρ)
+
+  ρ=0.95  →  σ ∝ 0.224   (tight)
+  ρ=0.85  →  σ ∝ 0.387   (73% wider)
+  ρ=0.70  →  σ ∝ 0.548   (2.4× wider — skip at this level)
+```
+
+Expected consecutive losses before a win:
+```
+  ρ=0.95 → P(loss) = 2.5%  → 1 loss per ~40 trades
+  ρ=0.85 → P(loss) = 7.5%  → 1 loss per ~13 trades
+```
+
+#### Proper Kelly bet sizing
+
+```
+For a pairs trade:
+  b = net win per unit stake = (1-sum)/sum
+  p = win prob ≈ ρ
+  q = 1-ρ
+
+  f* = (p×b - q) / b = ρ - (1-ρ)×sum/(1-sum)
+
+  ρ=0.95, sum=0.86: f* = 64.3%  (quarter-Kelly = 16.1%)
+  ρ=0.90, sum=0.86: f* = 56.0%  (quarter-Kelly = 14.0%)
+  ρ=0.86, sum=0.86: f* = 0%     (break-even, no bet)
+  ρ=0.80, sum=0.86: f* = -ve    (negative EV, skip)
+
+Scale by ρ/0.95 to reduce size when correlation is below baseline:
+  adjusted = f* × (ρ/0.95) × kelly_fraction × balance
+```
+
+#### Dynamic correlation factor from Binance (the v6 improvement)
+
+`binance_feed.py` stores live price history for every coin. At each window close, record the window return `(close - open) / open` for BTC and ETH. Compute Pearson correlation over the last 20 windows (~5 hours on 15-min, ~1.7 hours on 5-min):
+
+```python
+def rolling_correlation(self, sym_a: str, sym_b: str, n: int = 20) -> float | None:
+    a = list(self.window_returns[sym_a])[-n:]
+    b = list(self.window_returns[sym_b])[-n:]
+    if len(a) < 10: return None
+    mean_a, mean_b = sum(a)/len(a), sum(b)/len(b)
+    cov  = sum((x-mean_a)*(y-mean_b) for x,y in zip(a,b)) / len(a)
+    sd_a = math.sqrt(sum((x-mean_a)**2 for x in a) / len(a))
+    sd_b = math.sqrt(sum((x-mean_b)**2 for x in b) / len(b))
+    return cov / (sd_a * sd_b) if sd_a and sd_b else None
+```
+
+Apply it to Kelly as a scaling factor:
+
+```
+corr_factor = observed_rho / baseline_rho (0.95)
+
+ρ = 0.95  →  factor = 1.00  →  bet full half-Kelly
+ρ = 0.85  →  factor = 0.89  →  bet 89% of half-Kelly
+ρ = 0.75  →  factor = 0.79  →  bet 79% of half-Kelly
+ρ < 0.70  →  skip trade entirely (correlation breakdown)
+```
+
+When macro or coin-specific news causes BTC and ETH to decouple on Binance, the system automatically sizes down or skips — without requiring any manual intervention.
+
+#### Expected return per session
+
+| | 15-min markets | 5-min markets |
+|---|---|---|
+| Windows per day | 96 | 288 |
+| At 10% hit rate (sum < 0.90) | ~10 trades | ~29 trades |
+| At 20% hit rate | ~19 trades | ~58 trades |
+
+```
+Example: $500 bankroll, half-Kelly = $40.50/trade, ROI after fees = 10.7%
+EV per trade = $40.50 × 10.7% = $4.33
+
+15-min at 10% hit rate:  10 × $4.33 = $43/day
+5-min  at 10% hit rate:  29 × $4.33 = $126/day
+```
+
+The 5-min case delivers 3× daily EV from the same capital, same entry logic, and the same infrastructure (see [§5 WS Zombie fix](#5-websocket-zombie-connection-at-window-boundaries) for what needs retuning). Hit rate is the key unknown — must be measured via passive observation before live sizing.
+
+#### What to validate before sizing up
+
+| Question | How to measure |
+|----------|---------------|
+| Actual hit rate (how often sum < 0.90) | Passive observer 48–72h, log every signal |
+| Actual correlation rate (is 2.5% loss rate accurate?) | Track `pairs_outcome` log after 50+ trades |
+| Actual fee rate | Log `fee_paid` per trade, first 10 trades |
+| Actual vs modelled ROI | Compare `net` in outcomes log vs 10.7% model |
+| Correlation factor stability | Plot rolling ρ over 1 week, note regime changes |
+
+---
+
+### 9. Switching Between 15-min and 5-min Markets
+
+Polymarket runs both `btc-updown-15m-{ts}` and `btc-updown-5m-{ts}` simultaneously.
+
+**For the pairs bot:** One `.env` line controls everything — no code changes needed:
+
+```bash
+PAIRS_MARKET_WINDOW=15   # default: 15-min markets  (96 windows/day)
+PAIRS_MARKET_WINDOW=5    # switch:   5-min markets (288 windows/day)
+```
+
+This is **isolated from the v5 maker bot** — `crypto_markets.py` stays hardcoded to 15-min. The pairs bot patches the module at runtime inside its own process.
+
+**For the v5 maker bot** (not recommended to change): edit `crypto_markets.py` directly.
+
+**Additional tuning needed for 5-min:**
+
+| Setting | 15-min | 5-min | Why |
+|---------|--------|-------|-----|
+| `PAIRS_MIN_SECS_REMAINING` | `300` | `120` | Windows are shorter |
+| `PAIRS_RHO_LOOKBACK` | `20` (5h history) | `20` (100min history) | Same candle count |
+| `STALE_THRESHOLD` in `poly_feed.py` | `60` | `30` | Window is only 5 min |
+| REST heartbeat in `poll_poly_prices` | `15s` | `10s` | More aggressive refresh |
+
+**Why 5-min delivers 3× EV from the same capital:**
+Same infrastructure, same entry logic, 288 windows/day vs 96. At 10% hit rate: 29 trades/day vs 10, multiplying daily EV by ~3.
+
+**Why 5-min is harder operationally:**
+288 window transitions/day = 288 WS reconnects and 288 WS zombie events to survive. The forming candle has 5 minutes to settle (vs 15) so correlation noise is higher per candle. The Binance ρ bootstrap uses the same 20-candle lookback but that now covers only ~100 minutes of history. Always validate on 15-min first — at least 50 trades — before switching.
+
+---
+
+### 10. Pairs Bot v6 Configuration Reference
+
+Full `.env` settings for `python bot.py pairs`:
+
+```bash
+PAIRS_V6=BTC:ETH                  # Pairs (coin_a:coin_b, comma-separated). Phase 1: BTC:ETH only
+                                  # Phase 2: BTC:ETH,ETH:SOL,BTC:SOL
+PAIRS_MARKET_WINDOW=5             # 5 = 5-min markets | 15 = 15-min markets (default)
+                                  # Does NOT affect v5 maker bot — pairs-only setting
+PAIRS_ENTRY_THRESHOLD=0.88        # Enter when min(sum_1, sum_2) < this
+PAIRS_MIN_RHO=0.80                # Hard ρ floor. EV guard (ρ > sum) applied on top.
+PAIRS_RHO_LOOKBACK=20             # Completed candles for ρ calc (bootstrapped at startup)
+PAIRS_MIN_LEG_PRICE=0.15          # Skip if either leg below this (near-certain outcome)
+PAIRS_MAX_LEG_PRICE=0.85          # Skip if either leg above this (spread gone)
+PAIRS_MIN_SECS_REMAINING=300      # Min window time remaining to enter
+PAIRS_BANKROLL=100.0              # Set to actual Polymarket balance
+PAIRS_MAX_BET=15.0                # Max total spend per trade (both legs combined)
+PAIRS_MIN_BET=5.0                 # Min total spend per trade
+PAIRS_KELLY_FRACTION=0.25         # Quarter-Kelly — conservative for Phase 1
+PAIRS_DAILY_LOSS_LIMIT=30.0       # Halt for the day after this loss
+PAIRS_DATA_DIR=data/pairs         # State + trade log directory
+```
+
+**Kelly sizing formula:**
+
+```
+f* = (ρ × b - (1-ρ)) / b    where b = (1-sum)/sum
+
+Break-even rule: ρ must exceed sum to have positive EV.
+  sum=0.86 → need ρ > 0.86
+  sum=0.78 → need ρ > 0.78
+
+Example: ρ=0.95, sum=0.86, $100 balance, quarter-Kelly
+  raw Kelly = 64%  →  quarter = 16%  →  $16 spend (capped at MAX_BET)
+```
+
+After 10+ trades per band (`deep` <0.80, `medium` 0.80–0.86, `shallow` 0.86–0.90), the bot switches from theoretical ρ to observed band win rate — same auto-cap as v5.
 
 ---
 

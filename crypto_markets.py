@@ -11,7 +11,8 @@ import requests
 
 GAMMA_URL = "https://gamma-api.polymarket.com"
 
-# Supported coins and their slug prefixes
+# Supported coins and their slug prefixes (15-min markets)
+# To use 5-min markets in the pairs bot, set PAIRS_MARKET_WINDOW=5 in .env
 COIN_SLUGS = {
     "BTC": "btc-updown-15m",
     "ETH": "eth-updown-15m",
