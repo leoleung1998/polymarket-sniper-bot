@@ -970,6 +970,11 @@ async def run_micro_bot():
             if winner is None:
                 continue  # not settled yet
 
+            # Cancel any pending TP sell — market resolved before it filled
+            if pos.exit_order_id:
+                await _cancel_order(client, pos.exit_order_id)
+                pos.exit_order_id = ""
+
             pos.status = "won" if winner == pos.direction else "lost"
             bankroll.record_result(pos.cost, pos.payout, coin, pos.direction, pos.mode)
             pnl = pos.payout - pos.cost
