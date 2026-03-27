@@ -582,7 +582,7 @@ async def enter_pairs(
     ask_a = _best_ask(token_a)
     ask_b = _best_ask(token_b)
     if ask_a is not None and ask_b is not None:
-        clob_sum = round((ask_a + 0.002) + (ask_b + 0.002), 4)
+        clob_sum = round((ask_a + 0.005) + (ask_b + 0.005), 4)
         if clob_sum >= 1.0:
             console.print(
                 f"  [yellow]⚠ CLOB sum={clob_sum:.3f} ≥ 1.00 — feed lagged, skipping entry[/yellow]"

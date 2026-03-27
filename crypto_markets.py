@@ -58,7 +58,7 @@ def get_next_window_timestamp() -> int:
 
 def discover_market(coin: str, verbose: bool = False) -> CryptoMarket | None:
     """
-    Discover the current active 15-min market for a coin.
+    Discover the current active market for a coin.
     Tries current window first, then next window.
     Requires market.is_active (accepting_orders + seconds_remaining > 0).
     Use discover_market_tokens() for WS subscription — does not require is_active.
@@ -68,7 +68,6 @@ def discover_market(coin: str, verbose: bool = False) -> CryptoMarket | None:
         print(f"[markets] Unknown coin: {coin}")
         return None
 
-    # Try current window, then next
     for ts in [get_current_window_timestamp(), get_next_window_timestamp()]:
         slug = f"{prefix}-{ts}"
         market = fetch_market_by_slug(slug, coin)

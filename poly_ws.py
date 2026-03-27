@@ -21,6 +21,7 @@ import time
 import websockets
 import telegram_alerts as tg
 from poly_feed import poly_feed, poll_poly_prices
+from order_book import order_book
 
 WS_MARKET_URL  = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 PING_INTERVAL  = 10    # seconds between PING heartbeats
@@ -71,7 +72,7 @@ class PolyWSFeed:
             msg = {
                 "assets_ids": tokens,
                 "type":       "market",
-                "initial_dump": False,
+                "initial_dump": True,
                 "level": 2,
                 "custom_feature_enabled": False,
             }
@@ -119,7 +120,7 @@ class PolyWSFeed:
                 await ws.send(json.dumps({
                     "assets_ids": list(set(all_tokens)),
                     "type":       "market",
-                    "initial_dump": False,
+                    "initial_dump": True,
                     "level": 2,
                     "custom_feature_enabled": False,
                 }))
@@ -164,13 +165,39 @@ class PolyWSFeed:
     def _handle_message(self, msg: dict):
         mtype = msg.get("event_type", "")
 
-        if mtype == "price_change":
+        if mtype == "book":
+            # Full L2 snapshot — replace entire book for this token
+            token_id = msg.get("asset_id", "")
+            if token_id:
+                order_book.snapshot(
+                    token_id,
+                    msg.get("bids", []),
+                    msg.get("asks", []),
+                )
+
+        elif mtype == "price_change":
             for c in msg.get("price_changes", []):
                 token_id = c.get("asset_id", "")
                 bid = c.get("best_bid")
                 ask = c.get("best_ask")
                 if not (bid and ask and token_id):
                     continue
+
+                # Update order book with the individual level delta
+                raw_price = c.get("price")
+                raw_size  = c.get("size")
+                raw_side  = c.get("side", "")  # "BUY" = bid, "SELL" = ask
+                if raw_price is not None and raw_size is not None:
+                    try:
+                        ob_side = "bid" if raw_side == "BUY" else "ask"
+                        order_book.update_level(
+                            token_id, ob_side,
+                            float(raw_price), float(raw_size),
+                        )
+                    except (ValueError, TypeError):
+                        pass
+
+                # Update mid price in poly_feed (existing behaviour)
                 coin, side = self._token_map.get(token_id, (None, None))
                 if coin is None:
                     continue
@@ -180,7 +207,6 @@ class PolyWSFeed:
                     poly_feed.update(token_id, coin, side, mid)
                     self._update_count += 1
                     self._last_price_event = time.time()
-                    # Log when price events resume after a silence > 30s
                     if silent_for > 30:
                         print(f"[poly_ws] Price events resumed for {coin} after {silent_for:.0f}s silence")
                 except (ValueError, TypeError):

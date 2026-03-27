@@ -227,6 +227,19 @@ def cmd_pairs():
     pairs_main()
 
 
+def cmd_sniper():
+    """Run sniper bot — last-minute range buyer on 5-min markets."""
+    import asyncio
+    from sniping_strat import run_sniper_bot
+    asyncio.run(run_sniper_bot())
+
+
+def cmd_micro():
+    """Run microstructure bot — OBI + EWMA momentum, Mode A scalp + Mode B sniper."""
+    from micro_bot import main as micro_main
+    micro_main()
+
+
 def cmd_tp():
     """Run take profit monitor — sells positions when gain > TP_THRESHOLD."""
     from take_profit import main as tp_main
@@ -292,6 +305,8 @@ def main():
         "bracket": cmd_bracket,
         "maker": cmd_maker,
         "pairs": cmd_pairs,
+        "sniper": cmd_sniper,
+        "micro": cmd_micro,
         "tp": cmd_tp,
         "dual": cmd_dual,
     }
@@ -307,6 +322,7 @@ def main():
         console.print("  python bot.py bracket     # Start v5 weather bot (GFS ensemble)")
         console.print("  python bot.py maker       # Start v5 crypto maker (15-min markets)")
         console.print("  python bot.py pairs       # Start v6 delta-neutral pairs bot (Mode B)")
+        console.print("  python bot.py micro       # Start microstructure bot (OBI + EWMA)")
         console.print("  python bot.py tp          # Run take profit monitor")
         console.print("  python bot.py dual        # Run weather + crypto maker + TP in parallel")
         console.print("  python bot.py positions   # Show positions and P&L")

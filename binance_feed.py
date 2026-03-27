@@ -5,6 +5,7 @@ No API key required — uses public market data streams.
 
 import asyncio
 import json
+import math
 import ssl
 import time
 from dataclasses import dataclass, field
@@ -34,21 +35,66 @@ class PriceTick:
 
 
 @dataclass
+class EWMAState:
+    """Holds running fast/slow EWMA state for one symbol."""
+    fast: float | None = None   # ~10s half-life
+    slow: float | None = None   # ~30s half-life
+    last_ts: float | None = None
+
+    # half-life constants (seconds)
+    FAST_TAU: float = field(default=10.0, init=False, repr=False)
+    SLOW_TAU: float = field(default=30.0, init=False, repr=False)
+
+    def update(self, price: float):
+        now = time.time()
+        if self.last_ts is None:
+            self.fast = price
+            self.slow = price
+            self.last_ts = now
+            return
+        dt = now - self.last_ts
+        self.last_ts = now
+        alpha_fast = 1.0 - math.exp(-dt / self.FAST_TAU)
+        alpha_slow = 1.0 - math.exp(-dt / self.SLOW_TAU)
+        self.fast = alpha_fast * price + (1.0 - alpha_fast) * self.fast
+        self.slow = alpha_slow * price + (1.0 - alpha_slow) * self.slow
+
+    @property
+    def signal(self) -> float | None:
+        """fast - slow, normalised as % of slow. Positive = upward momentum."""
+        if self.fast is None or self.slow is None or self.slow == 0:
+            return None
+        return (self.fast - self.slow) / self.slow * 100
+
+
+@dataclass
 class PriceFeed:
     """Thread-safe price feed with history."""
     current: dict = field(default_factory=dict)         # symbol -> current price
     history: dict = field(default_factory=dict)          # symbol -> deque of PriceTick
     window_start_prices: dict = field(default_factory=dict)  # symbol -> price at window start
+    ewma: dict = field(default_factory=dict)             # symbol -> EWMAState
     _running: bool = False
 
     def __post_init__(self):
         for sym in SYMBOLS:
             self.history[sym] = deque(maxlen=1000)
+            self.ewma[sym] = EWMAState()
 
     def update(self, symbol: str, price: float):
         now = time.time()
         self.current[symbol] = price
         self.history[symbol].append(PriceTick(symbol, price, now))
+        if symbol in self.ewma:
+            self.ewma[symbol].update(price)
+
+    def get_ewma_signal(self, symbol: str) -> float | None:
+        """EWMA momentum signal: (fast - slow) / slow * 100.
+        Positive = price trending up. Negative = trending down.
+        Returns None until warmed up (first ~30s after startup).
+        """
+        state = self.ewma.get(symbol)
+        return state.signal if state else None
 
     def get_price(self, symbol: str) -> float | None:
         return self.current.get(symbol)
@@ -129,8 +175,15 @@ async def connect_binance():
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ssl=ssl_ctx) as ws:
+                _was_disconnected = not feed._running
                 print("[binance] Connected — streaming BTC/ETH/SOL prices")
                 feed._running = True
+                if _was_disconnected:
+                    try:
+                        import telegram_alerts as tg
+                        tg.send_message("✅ Binance WS reconnected")
+                    except Exception:
+                        pass
 
                 async for msg in ws:
                     try:
@@ -151,6 +204,11 @@ async def connect_binance():
         except (websockets.exceptions.ConnectionClosed, ConnectionError, OSError) as e:
             print(f"[binance] Connection lost: {e}. Reconnecting in 5s...")
             feed._running = False
+            try:
+                import telegram_alerts as tg
+                tg.send_message(f"⚠️ Binance WS disconnected — reconnecting in 5s\n{str(e)[:80]}")
+            except Exception:
+                pass
             await asyncio.sleep(5)
 
 
