@@ -51,6 +51,7 @@ from trader import init_client
 from vpn import ensure_vpn
 import telegram_alerts as tg
 from redeemer import check_and_redeem
+from portfolio import portfolio
 
 load_dotenv()
 
@@ -264,13 +265,15 @@ class MicroPosition:
     cost:          float
     window_ts:     int
     mode:          str    # "A" or "B"
-    order_id:      str   = ""
-    # Mode A exit tracking
-    exit_order_id: str   = ""
-    exit_price:    float = 0.0
-    exit_placed_at:float = 0.0
-    entered_at:    float = field(default_factory=time.time)
-    status:        str   = "open"   # open | sold | won | lost
+    order_id:       str   = ""
+    # Mode A / TP exit tracking
+    exit_order_id:  str   = ""
+    exit_price:     float = 0.0
+    exit_placed_at: float = 0.0
+    tp_last_attempt:float = 0.0   # throttle TP sell retries
+    entered_at:     float = field(default_factory=time.time)
+    status:         str   = "open"   # open | sold | won | lost
+    hold_to_resolve:bool  = False  # True when Mode A sell failed — holding to resolution
 
     @property
     def payout(self) -> float:
@@ -333,22 +336,30 @@ def evaluate_signal(coin: str, market: CryptoMarket) -> MicroSignal | None:
     if ewma is None:
         return None  # warming up
 
+    # Use live mid prices from order_book (WS) — market.up_price/.down_price can be
+    # stale by up to 10s, causing the price filter to miss near-resolved tokens.
+    live_up   = order_book.mid(market.up_token_id)   or market.up_price
+    live_down = order_book.mid(market.down_token_id) or market.down_price
+
     # OBI direction: which token has more buy pressure?
     # Positive OBI on a token = bids > asks near mid = price likely to rise
     if obi_up >= MICRO_OBI_THRESHOLD and ewma >= MICRO_EWMA_THRESHOLD:
         direction = "up"
         token_id  = market.up_token_id
-        price     = market.up_price
+        price     = live_up
         obi_val   = obi_up
     elif obi_down >= MICRO_OBI_THRESHOLD and ewma <= -MICRO_EWMA_THRESHOLD:
         direction = "down"
         token_id  = market.down_token_id
-        price     = market.down_price
+        price     = live_down
         obi_val   = obi_down
     else:
         return None  # no clear signal
 
-    # Price filter
+    if price is None:
+        return None
+
+    # Price filter — rejects near-resolved tokens (<0.20 or >0.85)
     if not (MICRO_MIN_PRICE <= price <= MICRO_MAX_PRICE):
         return None
 
@@ -429,7 +440,8 @@ async def _place_taker_order(
             console.print(f"  [red]❌ {label}: rejected — {resp}[/red]")
         return success, order_id, fill_price
     except Exception as e:
-        console.print(f"  [red]❌ {label} failed: {e}[/red]")
+        err_msg = getattr(e, "error_msg", None) or getattr(e, "message", None) or getattr(e, "args", (str(e),))[0]
+        console.print(f"  [red]❌ {label} failed: {type(e).__name__}: {err_msg}[/red]")
         return False, "", fill_price
 
 
@@ -461,22 +473,30 @@ async def _place_maker_order(
             console.print(f"  [red]❌ {label} maker: rejected — {resp}[/red]")
         return success, order_id, bid_price
     except Exception as e:
-        console.print(f"  [red]❌ {label} maker failed: {e}[/red]")
+        err_msg = getattr(e, "error_msg", None) or getattr(e, "message", None) or getattr(e, "args", (str(e),))[0]
+        console.print(f"  [red]❌ {label} maker failed: {type(e).__name__}: {err_msg}[/red]")
         return False, "", bid_price
 
 
 async def _place_exit_sell(
-    client, token_id: str, shares: float, fill_price: float, label: str
+    client, token_id: str, shares: float, fill_price: float, label: str,
+    sell_price: float | None = None,
 ) -> tuple[bool, str, float]:
-    """Place a GTC limit SELL at fill_price + MICRO_A_TP_PCT.
+    """Place a GTC limit SELL.
+    If sell_price is provided, use it directly (TP exit at current market price).
+    Otherwise use fill_price + MICRO_A_TP_PCT (Mode A scalp exit).
     Returns (success, order_id, exit_price).
     """
     from py_clob_client.clob_types import OrderArgs, OrderType
     from py_clob_client.order_builder.constants import SELL
 
-    # Sell at fill_price + TP, capped at 0.98
-    exit_price = round(min(0.98, fill_price * (1 + MICRO_A_TP_PCT)), 4)
-    size = round(shares, 2)
+    # Round to 0.01 tick — Polymarket CLOB rejects prices with sub-cent precision.
+    if sell_price is not None:
+        exit_price = round(round(min(0.98, sell_price) / 0.01) * 0.01, 2)
+    else:
+        exit_price = round(round(min(0.98, fill_price * (1 + MICRO_A_TP_PCT)) / 0.01) * 0.01, 2)
+    import math
+    size = math.floor(shares * 100) / 100  # floor to 2dp — never oversell due to CLOB rounding
 
     try:
         signed = client.create_order(OrderArgs(
@@ -489,9 +509,12 @@ async def _place_exit_sell(
             console.print(f"  [yellow]📤 {label}: exit sell {size:.0f} sh @ ${exit_price:.4f} (TP+{MICRO_A_TP_PCT*100:.0f}%)[/yellow]")
         else:
             console.print(f"  [red]❌ {label} exit sell rejected — {resp}[/red]")
+            _log(f"SELL_REJECTED: {label} price={exit_price} size={size} resp={resp}")
         return success, order_id, exit_price
     except Exception as e:
-        console.print(f"  [red]❌ {label} exit sell failed: {e}[/red]")
+        err_msg = getattr(e, "error_msg", None) or getattr(e, "message", None) or getattr(e, "args", (str(e),))[0]
+        console.print(f"  [red]❌ {label} exit sell failed: {type(e).__name__}: {err_msg}[/red]")
+        _log(f"SELL_FAILED: {label} price={exit_price} size={size} error={err_msg}")
         return False, "", exit_price
 
 
@@ -571,11 +594,14 @@ def _build_display(
     price_lag = int(now - ws_feed._last_price_event) if ws_feed._update_count > 0 else -1
     lag_str = f" [yellow]lag={price_lag}s[/yellow]" if price_lag > 5 else ""
 
+    port_val = portfolio.total_value()
+    port_str = f"  portfolio=${port_val:.2f}" if port_val > 0 else ""
+    port_ws  = "" if portfolio.connected else " [dim](port WS off)[/dim]"
     t.title = (
         f"[bold]🔬 Micro Bot[/bold]  "
         f"${bankroll.balance:.2f} ({wr})  "
-        f"loss=${bankroll.daily_loss:.2f}/{DAILY_LOSS_LIMIT:.0f}  "
-        f"{ws_src}{lag_str}  "
+        f"loss=${bankroll.daily_loss:.2f}/{DAILY_LOSS_LIMIT:.0f}{port_str}  "
+        f"{ws_src}{lag_str}{port_ws}  "
         f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
     )
 
@@ -633,6 +659,9 @@ def _build_display(
             exit_part = ""
             if pos.mode == "A" and pos.exit_order_id:
                 exit_part = f" → sell@${pos.exit_price:.3f}"
+            elif pos.mode == "A" and pos.hold_to_resolve:
+                tp_target = pos.fill_price * (1 + MICRO_B_TP_PCT)
+                exit_part = f" → hold/TP@${tp_target:.3f}"
             elif pos.mode == "A" and not pos.exit_order_id:
                 exit_part = " → placing sell…"
             pos_str = (
@@ -691,6 +720,15 @@ async def run_micro_bot():
     asyncio.create_task(connect_binance())
     asyncio.create_task(poll_poly_prices(MICRO_COINS, interval=3.0))
 
+    # Portfolio tracker — real-time cash + position value via user WS
+    portfolio.init(client, WALLET_ADDRESS)
+    await asyncio.to_thread(portfolio._fetch_balance)  # fetch real balance before loop starts
+    if portfolio.cash > 0:
+        bankroll.balance = portfolio.cash
+        bankroll._save()
+        console.print(f"[green]Bankroll synced to wallet: ${bankroll.balance:.2f}[/green]")
+    asyncio.create_task(portfolio.run())
+
     # State
     markets:     dict[str, CryptoMarket | None]  = {c: None for c in MICRO_COINS}
     positions:   dict[str, MicroPosition | None] = {c: None for c in MICRO_COINS}
@@ -699,6 +737,7 @@ async def run_micro_bot():
 
     last_display = 0.0
     last_discover = 0.0
+    last_resolve_poll: dict[str, float] = {}   # coin -> last time _resolve_winner was called
 
     # ── Initial WS token registration (before starting ws_feed.run) ──────────
     for coin in MICRO_COINS:
@@ -766,10 +805,12 @@ async def run_micro_bot():
                     # Waiting for maker bid to fill
                     filled = await _is_filled(client, pa["order_id"]) if pa["order_id"] else False
                     if filled:
-                        # Bid filled — immediately place limit sell exit
+                        # Brief delay so CLOB credits tokens before we place the sell
+                        await asyncio.sleep(3)
                         label_exit = f"{coin} {pa['direction'].upper()} A-exit"
+                        actual_shares_a = max(0.01, pa["shares"] - 0.02)
                         ok_sell, sell_id, exit_px = await _place_exit_sell(
-                            client, pa["token_id"], pa["shares"], pa["bid_price"], label_exit
+                            client, pa["token_id"], actual_shares_a, pa["bid_price"], label_exit
                         )
                         console.print(f"[green]  [{coin}] Mode A FILLED @ ${pa['bid_price']:.4f} → sell @ ${exit_px:.4f}[/green]")
                         _log(f"FILL_A: {coin} {pa['direction']} {pa['shares']:.0f}sh @ ${pa['bid_price']:.4f} → sell @ ${exit_px:.4f}")
@@ -785,6 +826,7 @@ async def run_micro_bot():
                                 token_id=pa["token_id"], fill_price=pa["bid_price"],
                                 shares=pa["shares"], cost=pa["cost"],
                                 window_ts=win_ts, mode="A", order_id=pa["order_id"],
+                                hold_to_resolve=True,
                             )
                             del pending_a[coin]
 
@@ -833,23 +875,40 @@ async def run_micro_bot():
                                 token_id=pa["token_id"], fill_price=pa["bid_price"],
                                 shares=pa["shares"], cost=pa["cost"],
                                 window_ts=win_ts, mode="A", order_id=pa["order_id"],
+                                hold_to_resolve=True,
                             )
                         else:
                             # Still above entry and enough time — aggressive taker sell
                             console.print(f"[yellow]  [{coin}] Mode A sell timed out — aggressive exit (price=${current_px:.3f})[/yellow]")
-                            ok_agg, _, agg_px = await _place_taker_order(
+                            ok_agg, agg_id, agg_px = await _place_taker_order(
                                 client, pa["token_id"], pa["shares"],
                                 current_px, f"{coin} A-agg-exit"
                             )
-                            profit = (agg_px - pa["bid_price"]) * pa["shares"]
-                            bankroll.balance += pa["cost"] + profit
-                            _log(f"AGG_EXIT_A: {coin} {pa['direction']} profit=${profit:+.2f}")
-                            tg.send_message(
-                                f"⚡ MICRO AGG EXIT {coin} [A]\n"
-                                f"Buy ${pa['bid_price']:.4f} → Sell ${agg_px:.4f}\n"
-                                f"Profit: {profit:+.2f}  Bankroll: ${bankroll.balance:.2f}"
-                            )
-                            bankroll._save()
+                            if ok_agg and agg_id:
+                                await asyncio.sleep(2)
+                                ok_agg = await _is_filled(client, agg_id)
+                                if not ok_agg:
+                                    console.print(f"[yellow]  [{coin}] Aggressive exit placed but NOT filled yet — holding to resolution[/yellow]")
+                            if ok_agg:
+                                profit = (agg_px - pa["bid_price"]) * pa["shares"]
+                                bankroll.balance += pa["cost"] + profit
+                                _log(f"AGG_EXIT_A: {coin} {pa['direction']} profit=${profit:+.2f}")
+                                tg.send_message(
+                                    f"⚡ MICRO AGG EXIT {coin} [A]\n"
+                                    f"Buy ${pa['bid_price']:.4f} → Sell ${agg_px:.4f}\n"
+                                    f"Profit: {profit:+.2f}  Bankroll: ${bankroll.balance:.2f}"
+                                )
+                                bankroll._save()
+                            else:
+                                # Aggressive sell failed — hold to resolution rather than dropping the position
+                                console.print(f"[yellow]  [{coin}] Aggressive exit failed — holding to resolution[/yellow]")
+                                positions[coin] = MicroPosition(
+                                    coin=coin, direction=pa["direction"],
+                                    token_id=pa["token_id"], fill_price=pa["bid_price"],
+                                    shares=pa["shares"], cost=pa["cost"],
+                                    window_ts=win_ts, mode="A", order_id=pa["order_id"],
+                                    hold_to_resolve=True,
+                                )
                         del pending_a[coin]
                         traded_windows[coin] = win_ts
 
@@ -897,6 +956,9 @@ async def run_micro_bot():
                         "bid_price": bid_price, "cost": cost,
                         "placed_at": now,
                     }
+                else:
+                    # Don't retry this window — signal may be stale or market rejecting
+                    traded_windows[coin] = win_ts
             else:  # Mode B — taker, hold to resolution
                 ok, order_id, fill_price = await _place_taker_order(
                     client, sig.token_id, shares, sig.price, label
@@ -909,29 +971,45 @@ async def run_micro_bot():
                         shares=shares, cost=cost, window_ts=win_ts,
                         mode="B", order_id=order_id,
                     )
-                    traded_windows[coin] = win_ts
+                traded_windows[coin] = win_ts  # skip rest of window regardless of success
 
         # ── Mode B / Mode A-fallback: TP check + exit sell tracking ─────
         for coin, pos in list(positions.items()):
             if not pos or pos.status != "open":
                 continue
 
-            market = markets.get(coin)
-            secs   = market.seconds_remaining if market else 0
+            market  = markets.get(coin)
+            # own_window: position was entered in the current 5-min window.
+            # After rollover, cur_ts advances but pos.window_ts still holds the old value.
+            # Never place new orders (TP sell) for old-window positions — Polymarket
+            # rejects orders on resolved/expired markets with 400 Bad Request.
+            own_window = (pos.window_ts == cur_ts)
+            secs   = market.seconds_remaining if (market and own_window) else 0
 
-            if not pos.exit_order_id:
-                # No exit sell placed yet — check if TP hit
+            if not pos.exit_order_id and own_window:
+                # No exit sell placed yet — check if TP hit.
+                # Only attempt sells for the current window — Polymarket rejects orders
+                # on resolved/expired markets (400). Old-window positions resolve via Gamma poll.
                 current_px = poly_feed.get_price(pos.token_id) or order_book.mid(pos.token_id)
                 tp_target  = pos.fill_price * (1 + MICRO_B_TP_PCT)
-                if current_px and current_px >= tp_target and secs > 5:
+                near_resolved = current_px and current_px >= 0.97
+                retry_ok      = now - pos.tp_last_attempt >= 30
+                # Don't attempt TP sell if: market nearly resolved (hold for $1.00),
+                # less than 30s left (Polymarket stops accepting orders), or retried recently
+                if current_px and current_px >= tp_target and secs > 30 and not near_resolved and retry_ok:
                     label = f"{coin} {pos.direction.upper()} TP"
                     console.print(
                         f"[bold yellow]🎯 TP HIT {coin} [{pos.mode}]  "
                         f"entry=${pos.fill_price:.3f} now=${current_px:.3f} "
                         f"(+{(current_px/pos.fill_price-1)*100:.1f}%)[/bold yellow]"
                     )
+                    pos.tp_last_attempt = now
+                    # Subtract small buffer — CLOB credits slightly fewer shares than ordered due to rounding
+                    actual_shares = max(0.01, pos.shares - 0.02)
+                    current_bid = order_book.best_bid(pos.token_id) or current_px
                     ok_tp, tp_id, tp_px = await _place_exit_sell(
-                        client, pos.token_id, pos.shares, pos.fill_price, label
+                        client, pos.token_id, actual_shares, pos.fill_price, label,
+                        sell_price=current_bid,
                     )
                     if ok_tp:
                         pos.exit_order_id  = tp_id
@@ -963,12 +1041,44 @@ async def run_micro_bot():
             if not pos or pos.status not in ("open",):
                 continue
             market = markets.get(coin)
-            if market and market.seconds_remaining > 10:
+            # Only skip resolution if the position's OWN window is still active.
+            # If markets[coin] has rolled to a NEW window, pos.window_ts != cur_ts
+            # and we must resolve the old position regardless of seconds_remaining.
+            own_window_still_running = (
+                market is not None
+                and pos.window_ts == cur_ts
+                and market.seconds_remaining > 10
+            )
+            if own_window_still_running:
+                # Still running — but check if position is stale (window already passed)
+                # This prevents permanent stuck state if _resolve_winner never returns
+                pos_age = time.time() - pos.entered_at
+                if pos_age > WINDOW_SECONDS + 120:
+                    console.print(f"[red]  [{coin}] position stuck for {pos_age:.0f}s — force-clearing as loss[/red]")
+                    tg.send_message(f"⚠️ MICRO {coin} position stuck {pos_age:.0f}s — force-cleared as loss")
+                    bankroll.record_result(pos.cost, 0.0, coin, pos.direction, pos.mode)
+                    positions[coin] = None
+                    traded_windows[coin] = pos.window_ts
                 continue  # still running
+
+            # Rate-limit Gamma API polls to once every 10s per coin
+            if now - last_resolve_poll.get(coin, 0) < 10:
+                continue
+            last_resolve_poll[coin] = now
 
             winner = _resolve_winner(coin, pos.window_ts)
             if winner is None:
-                continue  # not settled yet
+                # Not settled yet — but if we've been waiting too long, force-clear
+                pos_age = time.time() - pos.entered_at
+                if pos_age > WINDOW_SECONDS * 2:
+                    console.print(f"[red]  [{coin}] resolution timed out after {pos_age:.0f}s — force-clearing as loss[/red]")
+                    tg.send_message(f"⚠️ MICRO {coin} resolution timed out {pos_age:.0f}s — force-cleared as loss")
+                    if pos.exit_order_id:
+                        await _cancel_order(client, pos.exit_order_id)
+                    bankroll.record_result(pos.cost, 0.0, coin, pos.direction, pos.mode)
+                    positions[coin] = None
+                    traded_windows[coin] = pos.window_ts
+                continue
 
             # Cancel any pending TP sell — market resolved before it filled
             if pos.exit_order_id:
@@ -987,7 +1097,7 @@ async def run_micro_bot():
             # Trigger redemption
             try:
                 asyncio.create_task(asyncio.to_thread(
-                    check_and_redeem, client, 10, False
+                    check_and_redeem, FUNDER, PRIVATE_KEY
                 ))
             except Exception:
                 pass

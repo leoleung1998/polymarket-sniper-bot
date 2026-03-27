@@ -231,39 +231,65 @@ class PolyWSFeed:
     async def run(self, coins: list[str]):
         """
         Long-running WS feed task.
-        Retries up to MAX_RETRIES on disconnect, then falls back to REST poll.
+        Retries indefinitely with exponential backoff (capped at 60s).
+        Falls back to REST only after MAX_RETRIES *consecutive* rapid failures (<30s each).
         """
-        retries = 0
+        consecutive_failures = 0
+        MAX_BACKOFF = 60   # cap backoff at 60s
 
-        while retries < MAX_RETRIES:
+        while True:
+            connect_time = time.time()
             try:
                 self._connected = False
                 self._ws = None
                 await self._connect_and_stream(coins)
+                # If we get here the stream ended cleanly — treat as a disconnect
+                raise websockets.exceptions.ConnectionClosed(None, None)
 
             except websockets.exceptions.ConnectionClosed as e:
-                retries += 1
                 self._connected = False
-                msg = f"⚠️ PolyWS disconnected ({e}) — reconnecting... (attempt {retries}/{MAX_RETRIES})"
+                session_len = time.time() - connect_time
+                # Reset counter if connection was stable for >30s — only count rapid failures
+                if session_len > 30:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+
+                if consecutive_failures >= MAX_RETRIES:
+                    # Too many rapid consecutive failures — fall back to REST
+                    break
+
+                backoff = min(MAX_BACKOFF, 2 ** consecutive_failures)
+                msg = f"⚠️ PolyWS disconnected ({e}) — reconnecting in {backoff}s (failure {consecutive_failures}/{MAX_RETRIES})"
                 print(f"[poly_ws] {msg}")
                 if not self._disconnect_alerted:
                     tg.send_message(msg)
                     self._disconnect_alerted = True
-                await asyncio.sleep(2 ** retries)  # exponential backoff
+                await asyncio.sleep(backoff)
 
             except Exception as e:
-                retries += 1
-                msg = f"⚠️ PolyWS error: {str(e)[:120]} — reconnecting... (attempt {retries}/{MAX_RETRIES})"
+                self._connected = False
+                session_len = time.time() - connect_time
+                if session_len > 30:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+
+                if consecutive_failures >= MAX_RETRIES:
+                    break
+
+                backoff = min(MAX_BACKOFF, 2 ** consecutive_failures)
+                msg = f"⚠️ PolyWS error: {str(e)[:120]} — reconnecting in {backoff}s (failure {consecutive_failures}/{MAX_RETRIES})"
                 print(f"[poly_ws] {msg}")
                 if not self._disconnect_alerted:
                     tg.send_message(msg)
                     self._disconnect_alerted = True
-                await asyncio.sleep(2 ** retries)
+                await asyncio.sleep(backoff)
 
-        # Max retries exceeded — fall back to REST permanently
+        # Only reaches here after MAX_RETRIES consecutive rapid failures
         self._connected = False
         self._using_fallback = True
-        err = f"❌ PolyWS gave up after {MAX_RETRIES} retries — falling back to REST poll"
+        err = f"❌ PolyWS gave up after {MAX_RETRIES} consecutive failures — falling back to REST poll"
         print(f"[poly_ws] {err}")
         tg.send_message(err)
         await poll_poly_prices(coins)  # takes over indefinitely
